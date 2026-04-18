@@ -331,6 +331,16 @@ bot.on('text', async ctx => {
   }
 });
 
+// ─── Servidor HTTP (keepalive para Render) ────────────────────────────────────
+
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('OK');
+}).listen(PORT, () => console.log(`Health check escuchando en puerto ${PORT}`));
+
 // ─── Arranque ─────────────────────────────────────────────────────────────────
 
 bot.launch();
