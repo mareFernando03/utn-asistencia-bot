@@ -3,8 +3,9 @@ require('dotenv').config();
 
 const { Telegraf, Markup } = require('telegraf');
 const { Agent, fetch }     = require('undici');
-const fs   = require('fs');
-const path = require('path');
+const fs     = require('fs');
+const path   = require('path');
+const crypto = require('crypto');
 
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
@@ -13,6 +14,7 @@ if (!BOT_TOKEN) throw new Error('Falta BOT_TOKEN en variables de entorno');
 
 const BASE       = 'https://asistencia.frsfco.utn.edu.ar:4443';
 const USERS_PATH = path.join(__dirname, 'users.json');
+const BOT_URL    = (process.env.BOT_URL || '').replace(/\/$/, '');
 
 // Ignora certificado autofirmado del servidor UTN (igual que el .exe)
 const dispatcher = new Agent({ connect: { rejectUnauthorized: false } });
@@ -37,6 +39,9 @@ function saveUsers(u) {
 // Map<chatId, { step, legajo?, http?, materias? }>
 
 const states = new Map();
+
+// Tokens pendientes para captura de IP: Map<token, { chatId, ts }>
+const pendingIpTokens = new Map();
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
@@ -126,7 +131,7 @@ function parseMensajes(html) {
 
 // ─── Lógica UTN ───────────────────────────────────────────────────────────────
 
-async function loginYObtenerMaterias(legajo, password) {
+async function loginYObtenerMaterias(legajo, password, ip = '10.0.0.1') {
   const http = makeHttpSession();
 
   await http.get('/index.php');
@@ -140,8 +145,14 @@ async function loginYObtenerMaterias(legajo, password) {
     throw new Error('LOGIN_FAILED');
   }
 
-  // Bypass de IP: el backend acepta cualquier IP en el body
-  await http.post('/verificar_ip.php', { ip: '10.0.0.1' });
+  const ipResText = await http.post('/verificar_ip.php', { ip });
+  try {
+    const ipRes = JSON.parse(ipResText);
+    if (ipRes.acceso !== 'permitido') throw new Error('IP_DENEGADA');
+  } catch (e) {
+    if (e.message === 'IP_DENEGADA') throw e;
+    // Respuesta no-JSON: el servidor puede variar, continuar
+  }
 
   const applyHtml = await http.get('/apply-leave.php');
   return { http, materias: parseMaterias(applyHtml) };
@@ -177,6 +188,7 @@ bot.start(ctx =>
     '*UTN FRSFCO — Registro de Asistencia*\n\n' +
     'Comandos:\n' +
     '• /registrar — Marcar asistencia de hoy\n' +
+    '• /guardar\\_ip — Registrar tu IP desde la red UTN\n' +
     '• /olvida — Borrar credenciales guardadas',
     { parse_mode: 'Markdown' }
   )
@@ -195,6 +207,34 @@ bot.command('olvida', ctx => {
   ctx.reply('No tenés credenciales guardadas.');
 });
 
+// /guardar_ip
+bot.command('guardar_ip', ctx => {
+  const id = String(ctx.chat.id);
+  if (!BOT_URL) {
+    return ctx.reply(
+      '⚙️ El bot no tiene configurada la variable de entorno *BOT\\_URL*.\n' +
+      'Agregala en Render con el valor de la URL pública del servicio.',
+      { parse_mode: 'Markdown' }
+    );
+  }
+  // Limpiar tokens viejos de este usuario
+  for (const [tok, val] of pendingIpTokens) {
+    if (val.chatId === id) pendingIpTokens.delete(tok);
+  }
+  const token = crypto.randomBytes(16).toString('hex');
+  pendingIpTokens.set(token, { chatId: id, ts: Date.now() });
+  // Expirar token en 10 minutos
+  setTimeout(() => pendingIpTokens.delete(token), 10 * 60 * 1000);
+
+  ctx.reply(
+    '📶 *Guardá tu IP desde la red UTN*\n\n' +
+    '1. Conectate a la red de UTN (WiFi o cable)\n' +
+    `2. Abrí este link desde ese dispositivo:\n${BOT_URL}/guardar-ip/${token}\n\n` +
+    '_El link expira en 10 minutos._',
+    { parse_mode: 'Markdown' }
+  );
+});
+
 // /registrar
 bot.command('registrar', async ctx => {
   const id    = String(ctx.chat.id);
@@ -203,7 +243,7 @@ bot.command('registrar', async ctx => {
 
   if (users[id]) {
     await ctx.reply('⏳ Conectando con UTN...');
-    await ejecutarRegistrar(ctx, users[id].legajo, users[id].password);
+    await ejecutarRegistrar(ctx, users[id].legajo, users[id].password, users[id].ip);
   } else {
     states.set(id, { step: 'waiting_legajo' });
     ctx.reply('Ingresá tu *legajo* SYSACAD:', { parse_mode: 'Markdown' });
@@ -211,12 +251,12 @@ bot.command('registrar', async ctx => {
 });
 
 // Flujo principal
-async function ejecutarRegistrar(ctx, legajo, password) {
+async function ejecutarRegistrar(ctx, legajo, password, ip) {
   const id = String(ctx.chat.id);
   let http, materias;
 
   try {
-    ({ http, materias } = await loginYObtenerMaterias(legajo, password));
+    ({ http, materias } = await loginYObtenerMaterias(legajo, password, ip));
   } catch (e) {
     if (e.message === 'LOGIN_FAILED') {
       const users = loadUsers();
@@ -224,6 +264,14 @@ async function ejecutarRegistrar(ctx, legajo, password) {
       saveUsers(users);
       return ctx.reply(
         '❌ Login fallido. Revisá legajo y contraseña.\n\nUsá /registrar para intentar de nuevo.'
+      );
+    }
+    if (e.message === 'IP_DENEGADA') {
+      return ctx.reply(
+        '🚫 *IP no autorizada por UTN.*\n\n' +
+        'Conectate a la red UTN y usá /guardar\\_ip para registrar tu IP.\n' +
+        'Luego volvé a intentar con /registrar.',
+        { parse_mode: 'Markdown' }
       );
     }
     return ctx.reply(`❌ Error de conexión: ${e.message}`);
@@ -323,11 +371,12 @@ bot.on('text', async ctx => {
     states.delete(id);
 
     const users = loadUsers();
-    users[id] = { legajo, password: text };
+    const ip = users[id]?.ip;
+    users[id] = { legajo, password: text, ...(ip ? { ip } : {}) };
     saveUsers(users);
 
     await ctx.reply('✅ Credenciales guardadas. Conectando con UTN...');
-    await ejecutarRegistrar(ctx, legajo, text);
+    await ejecutarRegistrar(ctx, legajo, text, ip);
   }
 });
 
@@ -337,6 +386,41 @@ const http = require('http');
 const PORT = process.env.PORT || 3000;
 
 http.createServer((req, res) => {
+  const tokenMatch = req.url?.match(/^\/guardar-ip\/([a-f0-9]{32})$/);
+  if (tokenMatch) {
+    const token = tokenMatch[1];
+    const pending = pendingIpTokens.get(token);
+    if (!pending) {
+      res.writeHead(410);
+      return res.end('Link expirado o inválido.');
+    }
+    // IP real: respetar X-Forwarded-For de Render
+    const forwarded = req.headers['x-forwarded-for'];
+    const ip = forwarded ? forwarded.split(',')[0].trim() : req.socket.remoteAddress;
+
+    pendingIpTokens.delete(token);
+    const users = loadUsers();
+    const { chatId } = pending;
+    if (!users[chatId]) users[chatId] = {};
+    users[chatId].ip = ip;
+    saveUsers(users);
+
+    bot.telegram.sendMessage(chatId,
+      `✅ IP guardada correctamente: \`${ip}\`\n\nAhora podés usar /registrar desde cualquier red.`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(
+      `<!DOCTYPE html><html><head><meta charset="utf-8"><title>IP guardada</title></head>` +
+      `<body style="font-family:sans-serif;text-align:center;padding:2rem">` +
+      `<h2>✅ IP guardada correctamente</h2>` +
+      `<p>Tu IP <strong>${ip}</strong> fue registrada.</p>` +
+      `<p>Podés cerrar esta pestaña y volver al bot.</p>` +
+      `</body></html>`
+    );
+  }
+
   res.writeHead(200);
   res.end('OK');
 }).listen(PORT, () => console.log(`Health check escuchando en puerto ${PORT}`));
