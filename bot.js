@@ -131,7 +131,17 @@ function parseMensajes(html) {
 
 // ─── Lógica UTN ───────────────────────────────────────────────────────────────
 
-async function loginYObtenerMaterias(legajo, password, ip = '10.0.0.1') {
+async function getPublicIP() {
+  try {
+    const res = await fetch('https://api.ipify.org?format=json', { dispatcher });
+    const { ip } = await res.json();
+    return ip;
+  } catch {
+    return null;
+  }
+}
+
+async function loginYObtenerMaterias(legajo, password, ipGuardada = null) {
   const http = makeHttpSession();
 
   await http.get('/index.php');
@@ -144,6 +154,9 @@ async function loginYObtenerMaterias(legajo, password, ip = '10.0.0.1') {
   if (!loginHtml.includes('apply-leave.php')) {
     throw new Error('LOGIN_FAILED');
   }
+
+  const ip = ipGuardada || await getPublicIP();
+  if (!ip) throw new Error('NO_IP');
 
   const ipResText = await http.post('/verificar_ip.php', { ip });
   try {
@@ -269,10 +282,12 @@ async function ejecutarRegistrar(ctx, legajo, password, ip) {
     if (e.message === 'IP_DENEGADA') {
       return ctx.reply(
         '🚫 *IP no autorizada por UTN.*\n\n' +
-        'Conectate a la red UTN y usá /guardar\\_ip para registrar tu IP.\n' +
-        'Luego volvé a intentar con /registrar.',
+        'Tenés que estar conectado a la red WiFi de la UTN para registrar asistencia.',
         { parse_mode: 'Markdown' }
       );
+    }
+    if (e.message === 'NO_IP') {
+      return ctx.reply('❌ No se pudo detectar tu IP. Verificá tu conexión e intentá de nuevo.');
     }
     return ctx.reply(`❌ Error de conexión: ${e.message}`);
   }
