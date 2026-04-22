@@ -3,6 +3,7 @@ require('dotenv').config();
 
 const { Telegraf, Markup } = require('telegraf');
 const { Agent, fetch }     = require('undici');
+const { randomUUID }       = require('crypto');
 const fs   = require('fs');
 const path = require('path');
 
@@ -41,7 +42,7 @@ const states = new Map();
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 function makeHttpSession() {
-  const cookies = {};
+  const cookies = { deviceFingerprint: randomUUID() };
 
   function saveCookies(headers) {
     for (const c of (headers.getSetCookie?.() ?? [])) {
