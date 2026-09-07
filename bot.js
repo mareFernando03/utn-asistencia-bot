@@ -48,9 +48,14 @@ const bot = new Telegraf(BOT_TOKEN);
 
 bot.use((ctx, next) => {
   if (!autorizado(ctx.chat?.id)) {
+    // Mostrarle su propio id: es exactamente lo que hay que pegar en
+    // ALLOWED_IDS, y así no hace falta ir a buscarlo a otro bot.
     return ctx.reply(
       'Este es un bot privado y no estás en la lista de autorizados.\n\n' +
-      'No le mandes tu contraseña de SYSACAD a bots que no controlás.'
+      `Tu chat id es: ${ctx.chat?.id}\n\n` +
+      'Si el bot es tuyo, agregá ese número a la variable ALLOWED_IDS del ' +
+      'servidor (separá con comas si son varios) y volvé a escribirme.\n\n' +
+      'Si no es tuyo: no le mandes tu contraseña de SYSACAD a bots que no controlás.'
     );
   }
   return next();
@@ -61,9 +66,9 @@ bot.start(ctx =>
     '*UTN FRSFCO — Registro de Asistencia*\n\n' +
     'Marco tu asistencia sola durante la clase, así no se te escapa la ventana ' +
     'de minutos en que el docente la habilita.\n\n' +
-    '*Para empezar*\n' +
-    '• /registrar — cargá tus datos y marcá\n' +
-    '• /guardar\\_ip — una vez, desde el WiFi de la facu\n\n' +
+    '*Para empezar* (una sola vez)\n' +
+    '• /registrar — legajo y contraseña\n' +
+    '• /ip — la IP de la red de UTN, desde el WiFi de la facu\n\n' +
     '*Después*\n' +
     '• /auto — tu estado y el horario que aprendí\n' +
     '• /horarios — las materias que marco solo\n' +
@@ -280,9 +285,34 @@ bot.action('cancelar', async ctx => {
 // tiene que abrir un link estando en el campus. Ese request trae la IP pública de
 // la red, que es la misma para todos.
 
+// Camino corto: la escribís a mano. Sirve cuando no hay BOT_URL configurada.
+bot.command('ip', async ctx => {
+  const valor = (ctx.message.text.split(/\s+/)[1] || '').trim();
+
+  if (!valor) {
+    const actual = await store.getIp();
+    return ctx.reply(
+      `IP actual: ${actual ? actual : 'ninguna'}\n\n` +
+      'Para cargarla: conectate al WiFi de UTN, abrí https://api.ipify.org ' +
+      'y mandame ese número así:\n\n/ip 190.16.182.88'
+    );
+  }
+
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(valor) || valor.split('.').some(n => +n > 255)) {
+    return ctx.reply('Eso no parece una IPv4. Ejemplo: /ip 190.16.182.88');
+  }
+
+  await store.setIp(valor, ctx.chat.id);
+  await ctx.reply(`✅ IP de UTN cargada: ${valor}\n\nYa puedo registrar asistencias.`);
+});
+
 bot.command('guardar_ip', async ctx => {
   if (!BOT_URL) {
-    return ctx.reply('⚠️ Falta configurar BOT_URL en el servidor, no puedo generar el link.');
+    return ctx.reply(
+      '⚠️ No hay BOT_URL configurada, así que no puedo generar el link.\n\n' +
+      'Usá el camino corto: conectate al WiFi de UTN, abrí https://api.ipify.org ' +
+      'y mandame /ip <ese número>.'
+    );
   }
   const token = randomUUID();
   tokensIp.set(token, { chatId: String(ctx.chat.id), vence: Date.now() + 15 * 60 * 1000 });
