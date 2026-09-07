@@ -1,0 +1,75 @@
+{
+  "_comentario": [
+    "Franjas de cursada. dia: 1=lunes ... 7=domingo. Horas en 24h, hora local de Argentina.",
+    "'match' son frases alternativas: la materia del servidor coincide si su nombre",
+    "(normalizado, sin acentos, en minusculas) CONTIENE alguna de ellas.",
+    "Los nombres reales vienen de SYSACAD y pueden no coincidir con estos: usa",
+    "/materias_hoy durante una clase para ver los nombres exactos y corregirlos aca.",
+    "'activo': false apaga esa franja sin borrarla."
+  ],
+  "franjas": [
+    {
+      "id": "lun-sg",
+      "dia": 1,
+      "desde": "18:00",
+      "hasta": "21:00",
+      "materia": "Sistemas de Gestión",
+      "match": ["sistemas de gestion"],
+      "activo": true
+    },
+    {
+      "id": "lun-arq",
+      "dia": 1,
+      "desde": "21:00",
+      "hasta": "24:00",
+      "materia": "Arquitecturas Móviles",
+      "match": ["arquitecturas moviles", "aplicaciones moviles"],
+      "activo": true
+    },
+    {
+      "id": "mar-seg",
+      "dia": 2,
+      "desde": "18:00",
+      "hasta": "22:30",
+      "materia": "Seguridad",
+      "match": ["seguridad"],
+      "activo": true
+    },
+    {
+      "id": "mie-pps",
+      "dia": 3,
+      "desde": "18:00",
+      "hasta": "19:00",
+      "materia": "PPS (Práctica Supervisada)",
+      "match": ["practica supervisada", "pps"],
+      "activo": true
+    },
+    {
+      "id": "mie-pf",
+      "dia": 3,
+      "desde": "19:00",
+      "hasta": "23:30",
+      "materia": "Proyecto Final",
+      "match": ["proyecto final"],
+      "activo": true
+    },
+    {
+      "id": "jue-arq",
+      "dia": 4,
+      "desde": "18:00",
+      "hasta": "21:00",
+      "materia": "Arquitecturas Móviles",
+      "match": ["arquitecturas moviles", "aplicaciones moviles"],
+      "activo": true
+    },
+    {
+      "id": "jue-sg",
+      "dia": 4,
+      "desde": "21:00",
+      "hasta": "24:00",
+      "materia": "Sistemas de Gestión",
+      "match": ["sistemas de gestion"],
+      "activo": true
+    }
+  ]
+}

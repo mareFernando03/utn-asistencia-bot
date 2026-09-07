@@ -1,10 +1,19 @@
 'use strict';
+import 'dotenv/config';
 import { Agent, fetch } from 'undici';
 
 const BASE       = 'https://asistencia.frsfco.utn.edu.ar:4443';
-const LEGAJO     = '16143';
-const PASSWORD   = '***CREDENCIAL-ELIMINADA***';
-const IP         = null; // null = detectar automáticamente via ipify
+
+// Credenciales por entorno — NUNCA hardcodearlas: este archivo está versionado.
+//   AUTO_LEGAJO=16143 AUTO_PASSWORD=... node test-http.mjs
+const LEGAJO     = process.env.AUTO_LEGAJO;
+const PASSWORD   = process.env.AUTO_PASSWORD;
+const IP         = process.env.AUTO_IP || null; // null = detectar via ipify
+
+if (!LEGAJO || !PASSWORD) {
+  console.error('Falta AUTO_LEGAJO / AUTO_PASSWORD en el entorno (o en .env).');
+  process.exit(1);
+}
 
 const dispatcher = new Agent({ connect: { rejectUnauthorized: false } });
 

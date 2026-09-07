@@ -2,21 +2,18 @@
 require('dotenv').config();
 
 const { Telegraf, Markup } = require('telegraf');
-const { Agent, fetch }     = require('undici');
-const { randomUUID }       = require('crypto');
 const fs   = require('fs');
 const path = require('path');
+
+const utn          = require('./utn');
+const { crearAuto } = require('./auto');
 
 // ─── Constantes ───────────────────────────────────────────────────────────────
 
 const BOT_TOKEN  = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error('Falta BOT_TOKEN en variables de entorno');
 
-const BASE       = 'https://asistencia.frsfco.utn.edu.ar:4443';
 const USERS_PATH = path.join(__dirname, 'users.json');
-
-// Ignora certificado autofirmado del servidor UTN (igual que el .exe)
-const dispatcher = new Agent({ connect: { rejectUnauthorized: false } });
 
 // IDs de Telegram autorizados (opcional). Ej: ALLOWED_IDS=123,456
 const ALLOWED = process.env.ALLOWED_IDS
@@ -39,133 +36,6 @@ function saveUsers(u) {
 
 const states = new Map();
 
-// ─── HTTP helpers ─────────────────────────────────────────────────────────────
-
-function makeHttpSession() {
-  const cookies = { deviceFingerprint: randomUUID() };
-
-  function saveCookies(headers) {
-    for (const c of (headers.getSetCookie?.() ?? [])) {
-      const [pair] = c.split(';');
-      const eq = pair.indexOf('=');
-      cookies[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
-    }
-  }
-
-  function cookieHeader() {
-    return Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; ');
-  }
-
-  async function get(p) {
-    const res = await fetch(`${BASE}${p}`, {
-      dispatcher,
-      headers: { 'User-Agent': 'Mozilla/5.0', Cookie: cookieHeader() },
-    });
-    saveCookies(res.headers);
-    return res.text();
-  }
-
-  async function post(p, body) {
-    const res = await fetch(`${BASE}${p}`, {
-      method: 'POST',
-      dispatcher,
-      headers: {
-        'User-Agent': 'Mozilla/5.0',
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Cookie: cookieHeader(),
-        Origin: BASE,
-        Referer: `${BASE}${p}`,
-      },
-      body: new URLSearchParams(body).toString(),
-    });
-    saveCookies(res.headers);
-    return res.text();
-  }
-
-  return { get, post };
-}
-
-// ─── Parser HTML ──────────────────────────────────────────────────────────────
-
-function attr(tag, name) {
-  const m = new RegExp(`data-${name}="([^"]*)"`, 'i').exec(tag);
-  return m ? m[1] : '';
-}
-
-function parseMaterias(html) {
-  const start = html.indexOf('<select');
-  const end   = html.indexOf('</select>') + 9;
-  if (start === -1 || end < 9) return [];
-  const block = html.slice(start, end);
-  const out   = [];
-  const re    = /<option([^>]+)>\s*([^<]+)/gi;
-  let m;
-  while ((m = re.exec(block)) !== null) {
-    const tag = m[1];
-    if (tag.includes('disabled')) continue;
-    const valM = /value="(\d+)"/.exec(tag);
-    if (!valM) continue;
-    out.push({
-      id:           valM[1],
-      nombre:       m[2].trim(),
-      anio:         attr(tag, 'anio'),
-      especialidad: attr(tag, 'especialidad'),
-      plan:         attr(tag, 'plan'),
-      comision:     attr(tag, 'comision'),
-      condicional:  attr(tag, 'condicional'),
-      habilitada:   attr(tag, 'habilitada'),
-    });
-  }
-  return out;
-}
-
-function parseMensajes(html) {
-  const alerts = [...html.matchAll(/alert\('([^']+)'/g)].map(m => m[1]);
-  const divs   = [...html.matchAll(/innerHTML\s*=\s*'([^']+)'/g)].map(m => m[1]);
-  return [...alerts, ...divs].filter(Boolean);
-}
-
-// ─── Lógica UTN ───────────────────────────────────────────────────────────────
-
-async function loginYObtenerMaterias(legajo, password, ip) {
-  const http = makeHttpSession();
-
-  await http.get('/index.php');
-  const loginHtml = await http.post('/index.php', {
-    legajo,
-    password,
-    ingreso: 'Ingresar',
-  });
-
-  if (!loginHtml.includes('apply-leave.php')) {
-    throw new Error('LOGIN_FAILED');
-  }
-
-  const ipResText = await http.post('/verificar_ip.php', { ip });
-  try {
-    const ipRes = JSON.parse(ipResText);
-    if (ipRes.acceso !== 'permitido') throw new Error('IP_DENEGADA');
-  } catch (e) {
-    if (e.message === 'IP_DENEGADA') throw e;
-    // Respuesta no-JSON: el servidor puede variar, continuar
-  }
-
-  const applyHtml = await http.get('/apply-leave.php');
-  return { http, materias: parseMaterias(applyHtml) };
-}
-
-async function registrarAsistencia(http, materia) {
-  const html = await http.post('/apply-leave.php', {
-    id_materia:      materia.id,
-    anio_academico:  materia.anio,
-    id_especialidad: materia.especialidad,
-    id_plan:         materia.plan,
-    comision:        materia.comision,
-    signin:          '',
-  });
-  return parseMensajes(html);
-}
-
 // ─── Bot ──────────────────────────────────────────────────────────────────────
 
 const bot = new Telegraf(BOT_TOKEN);
@@ -182,9 +52,14 @@ bot.use((ctx, next) => {
 bot.start(ctx =>
   ctx.reply(
     '*UTN FRSFCO — Registro de Asistencia*\n\n' +
-    'Comandos:\n' +
+    'Manual:\n' +
     '• /registrar — Marcar asistencia de hoy\n' +
-    '• /olvida — Borrar credenciales guardadas',
+    '• /olvida — Borrar credenciales guardadas\n\n' +
+    'Automático:\n' +
+    '• /auto — Estado del modo automático y franjas configuradas\n' +
+    '• /auto\\_on — Reanudarlo\n' +
+    '• /auto\\_off — Pausarlo\n' +
+    '• /materias\\_hoy — Qué devuelve el sistema ahora mismo',
     { parse_mode: 'Markdown' }
   )
 );
@@ -223,7 +98,7 @@ async function ejecutarRegistrar(ctx, legajo, password, ip) {
   let http, materias;
 
   try {
-    ({ http, materias } = await loginYObtenerMaterias(legajo, password, ip));
+    ({ http, materias } = await utn.loginYObtenerMaterias(legajo, password, ip));
   } catch (e) {
     if (e.message === 'LOGIN_FAILED') {
       const users = loadUsers();
@@ -293,12 +168,19 @@ bot.action(/^mat_(\d+)$/, async ctx => {
   );
 
   try {
-    const mensajes = await registrarAsistencia(state.http, materia);
+    const mensajes = await utn.registrarAsistencia(state.http, materia);
     states.delete(id);
 
-    if (mensajes.some(m => /exitosa|registrada|success|marcada/i.test(m))) {
+    const clase = utn.clasificarMensajes(mensajes);
+
+    if (clase === 'ok') {
       ctx.editMessageText(
         `✅ *¡Asistencia registrada!*\n${materia.nombre}`,
+        { parse_mode: 'Markdown' }
+      );
+    } else if (clase === 'duplicada') {
+      ctx.editMessageText(
+        `ℹ️ *${materia.nombre}*\nYa tenías la asistencia registrada.`,
         { parse_mode: 'Markdown' }
       );
     } else if (mensajes.length > 0) {
@@ -317,6 +199,66 @@ bot.action('cancelar', async ctx => {
   await ctx.answerCbQuery();
   ctx.editMessageText('Cancelado.');
 });
+
+// ─── Modo automático ──────────────────────────────────────────────────────────
+
+const auto = crearAuto(bot);
+
+// Estos comandos operan sobre la cuenta SYSACAD del dueño (pausan su asistencia,
+// disparan logins con sus credenciales, listan sus materias). ALLOWED_IDS es
+// opcional, así que sin esta guarda cualquiera que encuentre el bot podría usarlos.
+const DUENIO = process.env.AUTO_CHAT_ID;
+
+function soloDuenio(handler) {
+  return async ctx => {
+    if (DUENIO && String(ctx.chat.id) !== String(DUENIO)) {
+      return ctx.reply('Este comando es solo para el dueño del bot.');
+    }
+    return handler(ctx);
+  };
+}
+
+bot.command('auto', soloDuenio(ctx =>
+  ctx.reply(auto.estadoTexto(), { parse_mode: 'Markdown' })
+));
+
+bot.command('auto_on', soloDuenio(async ctx => {
+  const n = auto.recargarHorarios();
+  if (!auto.configurado()) {
+    return ctx.reply(
+      '⚠️ No puedo activarlo: faltan variables AUTO_LEGAJO / AUTO_PASSWORD / AUTO_IP / AUTO_CHAT_ID.'
+    );
+  }
+  auto.habilitado = true;
+  await ctx.reply(`🟢 Modo automático activo — ${n} franjas cargadas.`);
+}));
+
+bot.command('auto_off', soloDuenio(async ctx => {
+  auto.habilitado = false;
+  await ctx.reply('⚪ Modo automático pausado. Reanudalo con /auto\\_on.', { parse_mode: 'Markdown' });
+}));
+
+// Diagnóstico: muestra los nombres exactos que devuelve SYSACAD, para ajustar
+// los 'match' de horarios.json.
+// Texto plano a propósito: los nombres vienen del servidor y un '_' o un '*'
+// rompen el parseo de Markdown (Telegram responde 400 y tira la promesa).
+bot.command('materias_hoy', soloDuenio(async ctx => {
+  await ctx.reply('⏳ Consultando el sistema UTN...');
+  try {
+    const materias = await auto.materiasAhora();
+    if (materias.length === 0) {
+      return await ctx.reply('📭 El servidor no ofrece ninguna materia en este momento.');
+    }
+    const lineas = materias.map(m =>
+      `${m.habilitada === 'S' ? '🟢' : '🔴'} ${m.nombre}\n` +
+      `   id=${m.id} comision=${m.comision} plan=${m.plan}`
+    );
+    const cuerpo = `📋 Materias que devuelve el sistema ahora\n\n${lineas.join('\n')}`;
+    await ctx.reply(cuerpo.length > 3900 ? cuerpo.slice(0, 3900) + '\n…' : cuerpo);
+  } catch (e) {
+    await ctx.reply(`❌ Error: ${e.message}`);
+  }
+}));
 
 // Texto libre → flujo de credenciales
 bot.on('text', async ctx => {
@@ -370,7 +312,14 @@ http.createServer((req, res) => {
 
 // ─── Arranque ─────────────────────────────────────────────────────────────────
 
+// Render free tier duerme el servicio tras ~15 min sin tráfico: auto-ping para
+// llegar despierto a la franja de cursada. Un cron externo es más confiable.
+if (process.env.BOT_URL) {
+  setInterval(() => { fetch(process.env.BOT_URL).catch(() => {}); }, 10 * 60 * 1000).unref?.();
+}
+
 bot.launch();
+auto.iniciar();
 console.log('Bot UTN iniciado.');
 
 process.once('SIGINT',  () => bot.stop('SIGINT'));
