@@ -1,4 +1,4 @@
 node_modules/
 .env
 users.json
-estado-auto.json
+store.json

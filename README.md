@@ -1,149 +1,129 @@
 # UTN FRSFCO — Bot de Asistencias
 
-Bot de Telegram para registrar asistencias en el [sistema web de UTN FRSFCO](https://asistencia.frsfco.utn.edu.ar:4443), sin depender del frontend.
+Bot de Telegram que registra asistencias en el [sistema de UTN FRSFCO](https://asistencia.frsfco.utn.edu.ar:4443) sin pasar por el frontend.
 
-Tiene dos modos:
+El problema que resuelve: el docente habilita la asistencia en una ventana de pocos minutos, y si no estás mirando el celular en ese momento, la perdés. El bot la mira por vos.
 
-- **Manual** — `/registrar`, elegís la materia de una lista y listo.
-- **Automático** — durante tus franjas de cursada el bot consulta el sistema cada minuto y registra la asistencia en cuanto el docente la habilita. Sin acción tuya.
+Dos modos:
 
-## Uso manual
+- **Manual** — `/registrar`, elegís la materia de una lista.
+- **Automático** — durante tus clases consulta cada minuto y registra en cuanto el docente habilita.
 
-1. Buscá `@UtnAsistBot` en Telegram
-2. Enviá `/registrar`
-3. Si es la primera vez, ingresá tu legajo, contraseña SYSACAD e IP pública de UTN
-4. Seleccioná la materia de la lista
+> **Bot privado.** Guarda contraseñas SYSACAD, que abren la cuenta académica completa de quien las presta. `ALLOWED_IDS` es obligatoria: sin esa lista blanca no se da de alta a nadie.
+
+## Uso
+
+1. El administrador agrega tu chat id a `ALLOWED_IDS` (lo ves con [@userinfobot](https://t.me/userinfobot))
+2. `/registrar` → legajo, contraseña, y aceptás qué se guarda
+3. `/guardar_ip` **una vez**, conectado al WiFi de UTN
+4. Listo: de ahí en más marca solo
 
 ### Comandos
 
 | Comando | Descripción |
 |---|---|
-| `/registrar` | Marca asistencia para el día de hoy |
-| `/olvida` | Borra las credenciales guardadas |
-| `/auto` | Estado del modo automático y franjas configuradas |
-| `/auto_on` · `/auto_off` | Reanuda / pausa el modo automático (recarga `horarios.json`) |
-| `/materias_hoy` | Muestra los nombres exactos que devuelve SYSACAD ahora mismo |
+| `/registrar` | Da de alta y marca asistencia ahora |
+| `/guardar_ip` | Link para capturar la IP de la red de UTN |
+| `/auto` | Tu estado y el horario aprendido |
+| `/horarios` | Las materias que marca solo |
+| `/auto_on` · `/auto_off` | Reanuda / pausa tu modo automático |
+| `/olvida` | Borra tus credenciales, horario y estado |
+| `/diag` | Diagnóstico técnico de la instancia |
 
-Los cuatro comandos `auto*` / `materias_hoy` están restringidos a `AUTO_CHAT_ID`: operan sobre la cuenta SYSACAD del dueño (pausan su asistencia, disparan logins con sus credenciales, listan sus materias), y `ALLOWED_IDS` es opcional.
+## Cómo aprende tu horario
 
-## Modo automático
+No hace falta cargarlo. Sale del propio servidor de UTN.
 
-### Cómo funciona
+**La clave:** el sistema solo lista una materia cuando hay clase de esa materia *en ese momento*, independientemente de que el docente haya habilitado la asistencia — eso último es el flag `habilitada` (🟢/🔴). Entonces anotar **cuándo aparece** cada materia equivale a leer tu horario de cursada de la fuente autoritativa.
 
-Cada `AUTO_INTERVAL_SEC` segundos (60 por defecto) el scheduler mira si el momento actual cae dentro de alguna franja de `horarios.json`. Si cae:
+El bot consulta cada 15 minutos fuera de las franjas conocidas y, en cuanto te ve una clase nueva, la aprende y te avisa. La ventana es el envolvente de lo observado más 15 minutos de margen, y se va ajustando sola con cada clase.
 
-1. Reutiliza la sesión HTTP abierta (vuelve a loguearse solo si caducó)
-2. Lista las materias que ofrece el sistema
-3. Busca la que corresponde a la franja según el campo `match`
-4. Si figura con `habilitada="S"`, hace el POST de registro y avisa por Telegram
+Dos consecuencias que importan:
 
-Registrada una materia, deja de consultarla por ese día. Fuera de las franjas no hace ninguna petición.
+- **Da igual si el docente habilita al principio o al final.** La ventana no se deduce de cuándo marcaste vos, sino de cuándo hay clase.
+- **No hay matching por nombre.** Las franjas guardan el ID de materia que devolvió el servidor, así que no hay nada que adivinar ni que se pueda romper si cambia un nombre.
 
-Eso resuelve el problema real: la ventana en la que el docente habilita la asistencia puede durar tres minutos, y el bot la está mirando cada 60 segundos.
+Si una materia se descubre estando ya habilitada, se registra en ese mismo ciclo — no espera al siguiente barrido.
 
-> **El modo automático no verifica que estés en el aula.** Marca presente en cada franja configurada, estés donde estés — el servidor de UTN acepta la IP que el cliente le declara, así que corriendo en Render no hay ninguna comprobación de presencia. Es una decisión consciente de quien lo configura; `AUTO_ENABLED=false` o `/auto_off` lo dejan pausado.
-
-### Configurar los horarios
-
-`horarios.json` define las franjas:
-
-```json
-{
-  "id": "lun-sg",
-  "dia": 1,                          // 1=lunes ... 7=domingo
-  "desde": "18:00",
-  "hasta": "21:00",                  // "24:00" = hasta medianoche
-  "materia": "Sistemas de Gestión",  // solo para los avisos
-  "match": ["sistemas de gestion"],  // frases a buscar en el nombre de SYSACAD
-  "activo": true
-}
-```
-
-`match` compara contra el nombre normalizado (minúsculas, sin acentos) y alcanza con que **alguna** frase esté contenida. Los nombres de SYSACAD no son los que usás vos: corré **`/materias_hoy` durante una clase** para ver los reales y ajustar `match`. Si el bot está en franja y no encuentra la materia, te manda por Telegram la lista de lo que devolvió el servidor.
-
-Después de editar `horarios.json`, `/auto_on` lo recarga sin reiniciar.
-
-### Avisos que manda
+### Avisos
 
 | Situación | Mensaje |
 |---|---|
 | Registró | ✅ Asistencia registrada + materia y hora |
-| Ya estaba registrada | ℹ️ Ya estaba |
-| No encontró la materia | ⚠️ Lista de lo que devolvió el servidor, para corregir `match` |
-| El servidor rechazó el registro | ⚠️ En el 1er intento y otra vez al rendirse (3 intentos) |
-| **La franja termina sin asistencia** | 🔴 Siempre, sea cual sea el motivo — el docente no habilitó, la materia no apareció, o el sistema no ofreció nada |
-| Login / IP / red fallando | ❌ Una sola vez por error, y otro aviso al recuperarse |
+| Ya estaba | ℹ️ Ya estaba registrada |
+| Materia nueva descubierta | 🆕 Una vez, al aprenderla |
+| El servidor rechazó | ⚠️ En el 1er intento y otra vez al rendirse (3 intentos) |
+| **La franja termina sin asistencia** | 🔴 Siempre, sea cual sea el motivo |
+| Login / IP / red fallando | ❌ Una vez por error, y otra al recuperarse |
 
-El aviso de cierre sale en los últimos 10 minutos de la franja y es el que importa: si algo falló, te enterás **esa misma noche**, no cuando salgan las actas.
+El aviso de cierre es el que importa: si algo falló, te enterás esa misma noche y no cuando salgan las actas.
 
-Un registro rechazado se reintenta hasta 3 veces y después la franja se da por perdida. Sin ese tope, una respuesta que el parser no entiende generaría un POST y un mensaje de Telegram por minuto durante horas.
+## La IP de UTN
 
-## Deploy en Render
+El sistema de UTN valida contra una whitelist la IP que el cliente le declara. Como el bot corre en un hosting, alguien tiene que estar en el campus y decírsela: `/guardar_ip` devuelve un link, lo abrís desde el WiFi de la facu, y el servidor lee la IP pública de ese request.
 
-1. Crear un **Web Service** conectado al repo
-2. Configurar las variables de entorno:
+Es **una sola para todos** (es la misma red), así que alcanza con que la cargue una persona. El link vale 15 minutos.
 
-| Variable | Valor |
-|---|---|
-| `BOT_TOKEN` | Token de [@BotFather](https://t.me/BotFather) |
-| `AUTO_LEGAJO` | Legajo SYSACAD |
-| `AUTO_PASSWORD` | Contraseña SYSACAD |
-| `AUTO_IP` | IP pública de la red UTN |
-| `AUTO_CHAT_ID` | Chat de Telegram al que van los avisos |
-| `ALLOWED_IDS` | (Opcional) IDs de Telegram autorizados, separados por coma |
-| `BOT_URL` | (Opcional) URL pública del servicio — activa el auto-ping anti-sleep |
-| `AUTO_ENABLED` | (Opcional) `false` para arrancar pausado |
-| `AUTO_INTERVAL_SEC` | (Opcional) intervalo de consulta, mínimo 30, default 60 |
-| `AUTO_FORZAR` | (Opcional) `true` = intentar igual si nunca habilitaron, sobre el final de la franja |
+## Deploy
 
-3. Render detecta el `Procfile` y ejecuta `node bot.js`
+Variables de entorno:
 
-**El plan free duerme el servicio tras ~15 min sin tráfico.** Con `BOT_URL` el bot se auto-pinguea cada 10 min, pero lo confiable es un cron externo ([cron-job.org](https://cron-job.org)) que pegue a la URL cada 10 minutos, o al menos que la despierte antes de las 18:00.
+| Variable | Obligatoria | Valor |
+|---|---|---|
+| `BOT_TOKEN` | sí | Token de [@BotFather](https://t.me/BotFather) |
+| `ALLOWED_IDS` | sí | Chat ids autorizados, separados por coma |
+| `STORE_KEY` | recomendada | Clave para cifrar contraseñas en reposo |
+| `BOT_URL` | sí | URL pública — sin esto no anda `/guardar_ip` |
+| `AUTO_ENABLED` | no | `false` para arrancar pausado |
+| `AUTO_INTERVAL_SEC` | no | Intervalo de consulta, mínimo 30, default 60 |
+| `AUTO_FORZAR` | no | `true` = intentar igual si nunca habilitaron |
 
-El disco de Render es efímero: por eso la config del modo automático va por variables de entorno y no por `users.json`, que se pierde en cada redeploy.
+**El plan free de Render duerme el servicio tras ~15 min sin tráfico.** Con `BOT_URL` el bot se auto-pinguea cada 10 min, pero lo confiable es un cron externo ([cron-job.org](https://cron-job.org)) que pegue a la URL. Si el servicio está dormido cuando empieza tu clase, no hay scheduler.
 
-## Desarrollo local
+**El disco de Render es efímero:** un redeploy borra `store.json`, o sea credenciales, horarios aprendidos e IP. Todos tienen que volver a darse de alta. Para que eso deje de pasar hay que mover `store.js` a una base de datos — su API ya es async justamente para que ese cambio sea reemplazar un archivo.
+
+## Seguridad
+
+Qué se guarda por usuario: legajo y contraseña SYSACAD.
+
+`STORE_KEY` cifra la contraseña en reposo (AES-256-GCM). **Qué protege:** que el archivo se escape — commit accidental, snapshot, backup, una copia que se lleva alguien. **Qué no protege:** a quien controle el proceso, porque ahí también está la clave. Sin `STORE_KEY` se guarda en texto plano y el bot lo avisa al arrancar y en `/diag`.
+
+El alta muestra explícitamente qué se guarda, quién puede verlo y que un redeploy lo borra, y requiere aceptación.
+
+Nunca hardcodear credenciales en archivos versionados: van a `.env` (git-ignored) o a las variables del hosting.
+
+## Desarrollo
 
 ```bash
 npm install
-cp .env.example .env   # completar BOT_TOKEN y las AUTO_*
+cp .env.example .env   # completar
 npm start              # producción
-npm run dev            # desarrollo con recarga automática
-npm test               # regresiones del scheduler (stubbea la red, no toca UTN)
+npm run dev            # recarga automática
+npm test               # regresiones (red stubbeada, no toca UTN)
 ```
 
-`npm test` cubre los casos que rompieron antes: franja que termina sin registrar, tope de reintentos, y respuestas del servidor que contienen "registrada" dentro de una negación.
-
-## Test del flujo HTTP
-
-Para diagnosticar problemas de IP o credenciales contra el backend de UTN:
-
-```bash
-AUTO_LEGAJO=... AUTO_PASSWORD=... node test-http.mjs
-```
-
-> Debe correrse desde la red WiFi de UTN. Detecta la IP pública automáticamente.
+`npm test` cubre el cifrado del store, el aprendizaje de horarios, el aislamiento entre usuarios, el tope de reintentos y los casos que rompieron antes.
 
 ## Arquitectura
 
 | Archivo | Responsabilidad |
 |---|---|
-| `utn.js` | Cliente del sistema UTN: sesión HTTP, parser del HTML, login, listar, registrar |
-| `auto.js` | Scheduler del modo automático: franjas, matching, estado, avisos |
-| `bot.js` | Comandos de Telegram y flujo manual |
-| `horarios.json` | Franjas de cursada (versionado, sin secretos) |
-| `estado-auto.json` | Qué franjas ya se resolvieron hoy (git-ignored, efímero) |
-| `test-auto.js` | Regresiones del scheduler con `utn.js` stubbeado |
+| `utn.js` | Cliente del sistema UTN: sesión HTTP, parser, login, listar, registrar |
+| `store.js` | Persistencia (JSON hoy; API async para poder pasar a una DB) |
+| `crypto.js` | Cifrado en reposo de las contraseñas |
+| `auto.js` | Scheduler multiusuario y aprendizaje de horarios |
+| `bot.js` | Comandos de Telegram, alta con consentimiento, captura de IP |
+| `test-auto.js` | Regresiones con `utn.js` stubbeado |
 
-El flujo HTTP replicado es el del frontend web:
+Flujo HTTP replicado del frontend:
 
 1. **Login** — `POST /index.php` con legajo y contraseña
-2. **Verificación de IP** — `POST /verificar_ip.php`. El servidor valida contra la whitelist de UTN **la IP que el cliente le manda en el body**, no la de la conexión
+2. **Verificación de IP** — `POST /verificar_ip.php`. El servidor valida **la IP que el cliente manda en el body**, no la de la conexión
 3. **Consulta de materias** — `GET /apply-leave.php`, parsea el `<select>`
 4. **Registro** — `POST /apply-leave.php` con los datos de la materia
 
 ## Notas
 
 - El servidor UTN usa un certificado SSL autofirmado — el bot lo ignora explícitamente
-- Las materias disponibles dependen del día y horario actual según el backend
-- Nunca hardcodear credenciales en archivos versionados: van a `.env` (local) o a las variables de entorno de Render
+- Las materias que devuelve dependen del día y horario actual: fuera de clase la lista viene vacía, y eso es lo normal
+- El modo automático registra según el horario, sin verificar presencia en el aula

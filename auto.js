@@ -1,16 +1,44 @@
 'use strict';
 
-// Modo automático: durante cada franja de cursada consulta el sistema UTN cada
-// AUTO_INTERVAL_SEC segundos y registra la asistencia en cuanto el docente
-// habilita la materia. No requiere ninguna acción del usuario.
+// Modo automático multiusuario, con horarios aprendidos del propio servidor.
+//
+// Cómo sabe cuándo hay clase: el sistema de UTN solo lista una materia cuando
+// hay clase de esa materia en ese momento, independientemente de que el docente
+// haya habilitado la asistencia (eso es el flag `habilitada`). Entonces anotar
+// cuándo aparece cada materia = leer el horario de la fuente autoritativa.
+//
+// Consecuencia práctica: da igual si el docente habilita al principio o al final
+// de la clase. La ventana no se deduce de cuándo marcaste vos, sino de cuándo el
+// servidor ofrece la materia.
+//
+// Las franjas guardan el ID de materia que devolvió el servidor, no su nombre,
+// así que no hay matching difuso que pueda fallar.
 
-const fs   = require('fs');
-const path = require('path');
-const utn  = require('./utn');
+const utn   = require('./utn');
+const store = require('./store');
 
-const TZ            = process.env.TZ_UTN || 'America/Argentina/Buenos_Aires';
-const HORARIOS_PATH = path.join(__dirname, 'horarios.json');
-const ESTADO_PATH   = path.join(__dirname, 'estado-auto.json');
+const TZ = process.env.TZ_UTN || 'America/Argentina/Buenos_Aires';
+
+// Estados que dan la franja por cerrada: dejan de consultarse ese día.
+const TERMINALES = new Set(['ok', 'duplicada', 'fallida']);
+
+// POSTs de registro fallidos antes de rendirse con una franja.
+const MAX_INTENTOS = 3;
+
+// Minutos antes del fin de franja en que se avisa "no se registró".
+const AVISO_FINAL_MIN = 10;
+
+// Techo de usuarios por tick: el server de UTN es frágil.
+const MAX_USUARIOS_POR_TICK = 25;
+
+// Barrido de descubrimiento: fuera de las franjas conocidas se consulta cada
+// tantos minutos, para mapear materias que todavía no se conocen.
+const DESCUBRIR_CADA_MIN = 15;
+const DESCUBRIR_DESDE    = 7 * 60;    // 07:00
+const DESCUBRIR_HASTA    = 24 * 60;   // 00:00
+
+// Margen que se le agrega a la ventana observada, en minutos.
+const MARGEN_OBSERVADO = 15;
 
 // ─── Tiempo local (Render corre en UTC: hay que forzar la zona) ───────────────
 
@@ -18,21 +46,18 @@ const DIAS = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
 const NOMBRE_DIA = ['', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'];
 
 function ahora(d = new Date()) {
-  const parts = new Intl.DateTimeFormat('en-CA', {
+  const p = new Intl.DateTimeFormat('en-CA', {
     timeZone: TZ,
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
     weekday: 'short',
-  }).formatToParts(d).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
-
-  const hora   = parseInt(parts.hour, 10);
-  const minuto = parseInt(parts.minute, 10);
+  }).formatToParts(d).reduce((acc, x) => (acc[x.type] = x.value, acc), {});
 
   return {
-    fecha:    `${parts.year}-${parts.month}-${parts.day}`,
-    dia:      DIAS[parts.weekday] ?? 0,
-    minutos:  hora * 60 + minuto,
-    hhmm:     `${parts.hour}:${parts.minute}`,
+    fecha:   `${p.year}-${p.month}-${p.day}`,
+    dia:     DIAS[p.weekday] ?? 0,
+    minutos: parseInt(p.hour, 10) * 60 + parseInt(p.minute, 10),
+    hhmm:    `${p.hour}:${p.minute}`,
   };
 }
 
@@ -41,69 +66,10 @@ function aMinutos(hhmm) {
   return h * 60 + (m || 0);
 }
 
-// ─── Horarios ─────────────────────────────────────────────────────────────────
-
-function cargarHorarios() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(HORARIOS_PATH, 'utf8'));
-    return (raw.franjas || []).filter(f => f.activo !== false);
-  } catch (e) {
-    console.error('[auto] No se pudo leer horarios.json:', e.message);
-    return [];
-  }
+function aHHMM(minutos) {
+  const m = Math.max(0, Math.min(1440, Math.round(minutos)));
+  return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
 }
-
-// Franjas que están corriendo en este instante.
-function franjasActivas(franjas, t) {
-  return franjas.filter(f =>
-    f.dia === t.dia &&
-    t.minutos >= aMinutos(f.desde) &&
-    t.minutos <  aMinutos(f.hasta)
-  );
-}
-
-function normalizar(s) {
-  return String(s)
-    .normalize('NFD').replace(/\p{M}/gu, '')   // saca acentos
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function buscarMateria(materias, franja) {
-  const frases = (franja.match || []).map(normalizar);
-  return materias.find(m => {
-    const nom = normalizar(m.nombre);
-    return frases.some(f => f && nom.includes(f));
-  });
-}
-
-// ─── Estado (qué franjas ya se resolvieron hoy) ───────────────────────────────
-// El disco de Render es efímero, así que esto sobrevive al reinicio del proceso
-// pero no a un redeploy. El servidor UTN rechaza duplicados igual, así que el
-// peor caso es un intento de más.
-
-function cargarEstado() {
-  try { return JSON.parse(fs.readFileSync(ESTADO_PATH, 'utf8')); }
-  catch { return {}; }
-}
-
-function guardarEstado(e) {
-  try { fs.writeFileSync(ESTADO_PATH, JSON.stringify(e, null, 2)); }
-  catch (err) { console.error('[auto] No se pudo guardar estado:', err.message); }
-}
-
-// ─── Scheduler ────────────────────────────────────────────────────────────────
-
-// Estados que dan la franja por cerrada: dejan de consultarse ese día.
-const TERMINALES = new Set(['ok', 'duplicada', 'fallida']);
-
-// POSTs de registro fallidos antes de rendirse con una franja. Sin este tope,
-// una respuesta que el parser no entiende se reintenta cada tick durante horas.
-const MAX_INTENTOS = 3;
-
-// Minutos antes del fin de franja en que se manda el aviso de "no se registró".
-const AVISO_FINAL_MIN = 10;
 
 // Un valor no numérico daría NaN, y setInterval(fn, NaN) dispara cada 1 ms.
 function intervaloMs(valor) {
@@ -111,175 +77,233 @@ function intervaloMs(valor) {
   return (Number.isFinite(n) ? Math.max(30, n) : 60) * 1000;
 }
 
+function franjasActivas(franjas, t) {
+  return (franjas || []).filter(f =>
+    f.dia === t.dia &&
+    t.minutos >= aMinutos(f.desde) &&
+    t.minutos <  aMinutos(f.hasta)
+  );
+}
+
+// ─── Horarios derivados de las observaciones ──────────────────────────────────
+
+// Convierte una observación acumulada en una franja utilizable. La ventana es el
+// envolvente de lo visto más un margen; se va ensanchando sola con cada clase.
+function franjaDesdeObservacion(o) {
+  return {
+    id:           `${o.dia}-${o.materiaId}`,
+    dia:          o.dia,
+    desde:        aHHMM(o.desdeMin - MARGEN_OBSERVADO),
+    hasta:        aHHMM(o.hastaMin + MARGEN_OBSERVADO),
+    materiaId:    o.materiaId,
+    materia:      o.materia,
+    vistas:       o.vistas,
+    ...(o.datos || {}),
+  };
+}
+
+// ─── Scheduler ────────────────────────────────────────────────────────────────
+
 function crearAuto(bot, opciones = {}) {
   const cfg = {
-    legajo:      process.env.AUTO_LEGAJO,
-    password:    process.env.AUTO_PASSWORD,
-    ip:          process.env.AUTO_IP,
-    chatId:      process.env.AUTO_CHAT_ID,
-    intervalo:   intervaloMs(process.env.AUTO_INTERVAL_SEC),
-    // Si la franja termina y el docente nunca habilitó, intentar igual una vez.
-    forzar:      process.env.AUTO_FORZAR === 'true',
+    intervalo: intervaloMs(process.env.AUTO_INTERVAL_SEC),
+    forzar:    process.env.AUTO_FORZAR === 'true',
     ...opciones,
   };
 
   let habilitado = process.env.AUTO_ENABLED !== 'false';
-  let estado     = cargarEstado();
-  let franjas    = cargarHorarios();
-  let sesion     = null;   // sesión HTTP reutilizada entre ticks
   let corriendo  = false;
   let timer      = null;
-  let ultimoError = null;  // para no spamear el mismo error cada minuto
+  let ultimoTick = null;
 
-  function configurado() {
-    return Boolean(cfg.legajo && cfg.password && cfg.ip && cfg.chatId);
-  }
+  const sesiones   = new Map();   // chatId → sesión HTTP reutilizada
+  const errores    = new Map();   // chatId → último error avisado
+  const ultimoScan = new Map();   // chatId → minuto del último barrido
 
-  async function avisar(texto) {
-    if (!cfg.chatId) return;
+  async function avisar(chatId, texto) {
     try {
-      await bot.telegram.sendMessage(cfg.chatId, texto, { parse_mode: 'Markdown' });
+      await bot.telegram.sendMessage(chatId, texto, { parse_mode: 'Markdown' });
     } catch (e) {
-      console.error('[auto] No se pudo notificar:', e.message);
+      console.error(`[auto] No se pudo notificar a ${chatId}:`, e.message);
     }
-  }
-
-  // Fusiona con lo que ya había: los flags de "ya avisé" no se deben perder al
-  // actualizar el resultado.
-  function marcar(clave, valor) {
-    estado[clave] = { ...estado[clave], ...valor, ts: new Date().toISOString() };
-    guardarEstado(estado);
-  }
-
-  // Purga entradas de días anteriores para que estado-auto.json no crezca.
-  function limpiarEstado(fecha) {
-    let cambio = false;
-    for (const k of Object.keys(estado)) {
-      if (!k.startsWith(`${fecha}|`)) { delete estado[k]; cambio = true; }
-    }
-    if (cambio) guardarEstado(estado);
   }
 
   // Devuelve también la sesión usada: quien registre después debe usar ESA y no
-  // releer `sesion`, que otra llamada concurrente puede haber puesto en null.
-  async function obtenerMaterias() {
-    if (sesion) {
-      const materias = await utn.listarMaterias(sesion);
-      if (materias !== null) return { http: sesion, materias };
-      sesion = null;  // sesión caducada → volver a loguear
+  // releer el Map, que otra llamada puede haber invalidado mientras tanto.
+  async function obtenerMaterias(chatId, u, ip) {
+    const previa = sesiones.get(chatId);
+    if (previa) {
+      const materias = await utn.listarMaterias(previa);
+      if (materias !== null) return { http: previa, materias };
+      sesiones.delete(chatId);
     }
-    const http = await utn.abrirSesion(cfg.legajo, cfg.password, cfg.ip);
-    sesion = http;
+    const http = await utn.abrirSesion(u.legajo, u.password, ip);
+    sesiones.set(chatId, http);
     return { http, materias: (await utn.listarMaterias(http)) ?? [] };
   }
 
+  // ¿Corresponde consultar a este usuario en este instante?
+  // Sí si está dentro de alguna franja conocida sin resolver, o si toca barrido.
+  function debeConsultar(u, t, franjas) {
+    if (franjasActivas(franjas, t).length > 0) return 'franja';
+
+    if (t.minutos < DESCUBRIR_DESDE || t.minutos >= DESCUBRIR_HASTA) return null;
+    const ultimo = ultimoScan.get(u.chatId);
+    if (ultimo == null || t.minutos - ultimo >= DESCUBRIR_CADA_MIN) return 'barrido';
+    return null;
+  }
+
+  // Franjas confirmadas por el usuario + las aprendidas por observación.
+  async function franjasDeUsuario(u) {
+    const observaciones = await store.getObservaciones(u.chatId);
+    const confirmadas   = u.franjas || [];
+    const ids           = new Set(confirmadas.map(f => f.id));
+    return [
+      ...confirmadas,
+      ...observaciones.map(franjaDesdeObservacion).filter(f => !ids.has(f.id)),
+    ];
+  }
+
+  async function procesarUsuario(u, t, ip) {
+    const observaciones = await store.getObservaciones(u.chatId);
+    const franjasPrevias = await franjasDeUsuario(u);
+
+    const motivo = debeConsultar({ ...u, chatId: u.chatId }, t, franjasPrevias);
+    if (!motivo) return;
+
+    let http, materias;
+    try {
+      ({ http, materias } = await obtenerMaterias(u.chatId, u, ip));
+      const previo = errores.get(u.chatId);
+      if (previo) {
+        errores.delete(u.chatId);
+        await avisar(u.chatId, `✅ Modo automático recuperado (${previo} resuelto).`);
+      }
+    } catch (e) {
+      sesiones.delete(u.chatId);
+      const motivoErr =
+        e.message === 'LOGIN_FAILED' ? 'login rechazado — si cambiaste tu contraseña SYSACAD, usá /olvida y volvé a cargarla' :
+        e.message === 'IP_DENEGADA'  ? 'UTN rechazó la IP — hay que actualizarla con /guardar\\_ip desde el WiFi de la facu' :
+        `error de conexión: ${e.message}`;
+      if (errores.get(u.chatId) !== motivoErr) {
+        errores.set(u.chatId, motivoErr);
+        await avisar(u.chatId, `❌ *Modo automático*: ${motivoErr}.\n_Sigo reintentando._`);
+      }
+      return;
+    }
+
+    if (motivo === 'barrido') ultimoScan.set(u.chatId, t.minutos);
+
+    // Toda materia listada implica que hay clase ahora: es horario, se anota
+    // esté habilitada o no.
+    const nuevas = [];
+    for (const m of materias) {
+      const previa = observaciones.find(o => o.dia === t.dia && o.materiaId === m.id);
+      await store.registrarObservacion(u.chatId, t.dia, m, t.minutos);
+      if (!previa) nuevas.push(m);
+    }
+
+    // Recalcular con lo recién observado: si una materia se descubre AHORA y ya
+    // está habilitada, hay que registrarla en este mismo ciclo. Esperar al
+    // siguiente podía costar hasta 15 minutos (el paso del barrido) y perder la
+    // ventana entera del docente.
+    const franjas = await franjasDeUsuario(u);
+
+    // Registrar donde corresponda.
+    for (const f of franjas) {
+      if (!franjasActivas([f], t).length) continue;
+
+      const clave = `${t.fecha}|${u.chatId}|${f.id}`;
+      const st    = (await store.getEstado(clave)) || {};
+      if (TERMINALES.has(st.resultado)) continue;
+
+      const porTerminar = aMinutos(f.hasta) - t.minutos <= AVISO_FINAL_MIN;
+      const materia     = materias.find(m => m.id === f.materiaId);
+
+      const avisarCierre = async (razon) => {
+        if (!porTerminar || st.avisoFinal) return;
+        await store.marcarEstado(clave, { avisoFinal: true });
+        await avisar(u.chatId,
+          `🔴 *${f.materia}*: la franja termina (${f.hasta}) y no se registró la asistencia.\n${razon}`);
+      };
+
+      if (!materia) {
+        await avisarCierre(materias.length === 0
+          ? '_El sistema no ofreció ninguna materia._'
+          : '_Tu materia no apareció entre las que ofrece el sistema._');
+        continue;
+      }
+
+      if (materia.habilitada !== 'S' && !(cfg.forzar && porTerminar)) {
+        await avisarCierre('_El docente nunca la habilitó._');
+        continue;
+      }
+
+      const intentos = (st.intentos || 0) + 1;
+      const mensajes = await utn.registrarAsistencia(http, materia);
+      const clase    = utn.clasificarMensajes(mensajes);
+      const cond     = materia.condicional === 'S' ? '\n⚠️ _Figurás como condicional._' : '';
+
+      if (clase === 'ok') {
+        await store.marcarEstado(clave, { resultado: 'ok', intentos });
+        await avisar(u.chatId,
+          `✅ *Asistencia registrada*\n${materia.nombre}\n_${t.hhmm} — automático_${cond}`);
+        continue;
+      }
+      if (clase === 'duplicada') {
+        await store.marcarEstado(clave, { resultado: 'duplicada', intentos });
+        await avisar(u.chatId, `ℹ️ *${materia.nombre}*: ya estaba registrada.`);
+        continue;
+      }
+
+      // Rechazada o ilegible: reintentar con tope. Sin él, una respuesta que el
+      // parser no entiende genera un POST y un mensaje por tick durante horas.
+      const agotado = intentos >= MAX_INTENTOS;
+      await store.marcarEstado(clave, { resultado: agotado ? 'fallida' : clase, intentos });
+
+      if (intentos === 1 || agotado) {
+        const detalle = mensajes.length
+          ? `respuesta del servidor:\n${mensajes.join('\n')}`
+          : 'el servidor respondió algo que no pude interpretar.';
+        await avisar(u.chatId,
+          `⚠️ *${materia.nombre}* — ${detalle}\n\n` +
+          (agotado
+            ? `_Me rindo con esta franja tras ${intentos} intentos. Probá /registrar a mano._`
+            : `_Reintento hasta ${MAX_INTENTOS} veces._`));
+      }
+    }
+
+    // Avisar de materias nuevas descubiertas, una vez cada una.
+    for (const m of nuevas) {
+      await avisar(u.chatId,
+        `🆕 Descubrí que cursás *${m.nombre}* los ${NOMBRE_DIA[t.dia]} ` +
+        `(la vi a las ${t.hhmm}).\n\n` +
+        `Ya la voy a marcar sola. Mirá /horarios para ver la ventana que aprendí.`);
+    }
+  }
+
   async function tick() {
-    if (!habilitado || corriendo || !configurado()) return;
+    if (!habilitado || corriendo) return;
 
-    const t       = ahora();
-    const activas = franjasActivas(franjas, t);
-    if (activas.length === 0) { sesion = null; return; }
+    const t = ahora();
+    ultimoTick = t;
 
-    // Franjas de hoy que todavía no se resolvieron.
-    const pendientes = activas.filter(f => !TERMINALES.has(estado[`${t.fecha}|${f.id}`]?.resultado));
-    if (pendientes.length === 0) return;
+    const usuarios = await store.usuariosActivos();
+    if (usuarios.length === 0) return;
+
+    const ip = await store.getIp();
+    if (!ip) return;   // sin IP de UTN no hay nada que hacer
 
     corriendo = true;
     try {
-      limpiarEstado(t.fecha);
-      const { http, materias } = await obtenerMaterias();
-
-      if (ultimoError) {
-        await avisar(`✅ Modo automático recuperado (${ultimoError} resuelto).`);
-        ultimoError = null;
-      }
-
-      for (const f of pendientes) {
-        const clave       = `${t.fecha}|${f.id}`;
-        const st          = estado[clave] || {};
-        const porTerminar = aMinutos(f.hasta) - t.minutos <= AVISO_FINAL_MIN;
-        const materia     = buscarMateria(materias, f);
-
-        // Aviso de cierre: la franja se termina sin asistencia registrada. Va en
-        // TODOS los caminos que no llegan a registrar — incluido el de "el
-        // servidor no devolvió ninguna materia", que si no pasaría en silencio.
-        const avisarCierre = async (motivo) => {
-          if (!porTerminar || st.avisoFinal) return;
-          marcar(clave, { avisoFinal: true });
-          await avisar(
-            `🔴 *${f.materia}*: la franja termina (${f.hasta}) y no se registró la ` +
-            `asistencia.\n${motivo}`
-          );
-        };
-
-        if (!materia) {
-          // Avisar una sola vez qué nombres devolvió el servidor, así se pueden
-          // corregir los 'match' de horarios.json.
-          if (!st.avisoSinMatch && materias.length > 0) {
-            marcar(clave, { resultado: 'sin-match', avisoSinMatch: true });
-            await avisar(
-              `⚠️ *${f.materia}*: no encontré la materia en el sistema.\n\n` +
-              `El servidor devolvió:\n${materias.map(m => `• ${m.nombre}`).join('\n')}\n\n` +
-              `Corregí el campo \`match\` de la franja \`${f.id}\` en horarios.json.`
-            );
-          }
-          await avisarCierre(materias.length === 0
-            ? '_El sistema no ofreció ninguna materia en toda la franja._'
-            : `_No hubo ninguna materia que coincidiera con \`${f.id}\`._`);
-          continue;
-        }
-
-        if (materia.habilitada !== 'S' && !(cfg.forzar && porTerminar)) {
-          // El docente todavía no abrió la ventana: seguir esperando.
-          await avisarCierre('_El docente nunca la habilitó._');
-          continue;
-        }
-
-        const intentos = (st.intentos || 0) + 1;
-        const mensajes = await utn.registrarAsistencia(http, materia);
-        const clase    = utn.clasificarMensajes(mensajes);
-        const cond     = materia.condicional === 'S' ? '\n⚠️ _Figurás como condicional._' : '';
-
-        if (clase === 'ok') {
-          marcar(clave, { resultado: 'ok', materia: materia.nombre, intentos });
-          await avisar(`✅ *Asistencia registrada*\n${materia.nombre}\n_${t.hhmm} — automático_${cond}`);
-          continue;
-        }
-        if (clase === 'duplicada') {
-          marcar(clave, { resultado: 'duplicada', materia: materia.nombre, intentos });
-          await avisar(`ℹ️ *${materia.nombre}*: ya estaba registrada.`);
-          continue;
-        }
-
-        // Rechazada o ilegible: reintentar, pero con tope. Sin él, un mensaje que
-        // el parser no entiende genera un POST y un mensaje de Telegram por tick.
-        const agotado = intentos >= MAX_INTENTOS;
-        marcar(clave, { resultado: agotado ? 'fallida' : clase, materia: materia.nombre, intentos });
-
-        if (intentos === 1 || agotado) {
-          const detalle = mensajes.length
-            ? `respuesta del servidor:\n${mensajes.join('\n')}`
-            : 'el servidor respondió algo que no pude interpretar.';
-          await avisar(
-            `⚠️ *${materia.nombre}* — ${detalle}\n\n` +
-            (agotado
-              ? `_Me rindo con esta franja tras ${intentos} intentos. Probá /registrar a mano._`
-              : `_Reintento hasta ${MAX_INTENTOS} veces._`)
-          );
+      await store.limpiarEstado(t.fecha);
+      for (const u of usuarios.slice(0, MAX_USUARIOS_POR_TICK)) {
+        try {
+          await procesarUsuario(u, t, ip);
+        } catch (e) {
+          console.error(`[auto] usuario ${u.chatId}:`, e.message);
         }
       }
-    } catch (e) {
-      sesion = null;
-      const motivo =
-        e.message === 'LOGIN_FAILED' ? 'login rechazado (revisá AUTO_LEGAJO / AUTO_PASSWORD)' :
-        e.message === 'IP_DENEGADA'  ? 'IP no autorizada (actualizá AUTO_IP con la IP pública de UTN)' :
-        `error de conexión: ${e.message}`;
-
-      if (ultimoError !== motivo) {   // avisar el cambio, no cada minuto
-        ultimoError = motivo;
-        await avisar(`❌ *Modo automático*: ${motivo}.\n_Sigo reintentando._`);
-      }
-      console.error('[auto]', motivo);
     } finally {
       corriendo = false;
     }
@@ -287,69 +311,79 @@ function crearAuto(bot, opciones = {}) {
 
   return {
     iniciar() {
-      if (!configurado()) {
-        console.log('[auto] Desactivado: faltan AUTO_LEGAJO / AUTO_PASSWORD / AUTO_IP / AUTO_CHAT_ID');
-        return;
-      }
       timer = setInterval(() => { tick().catch(e => console.error('[auto]', e)); }, cfg.intervalo);
       timer.unref?.();
       tick().catch(e => console.error('[auto]', e));
-      console.log(`[auto] Activo — ${franjas.length} franjas, tick cada ${cfg.intervalo / 1000}s (${TZ})`);
+      console.log(`[auto] Activo — tick cada ${cfg.intervalo / 1000}s (${TZ})`);
     },
 
     detener() { if (timer) clearInterval(timer); timer = null; },
 
-    // Ejecuta un ciclo ahora mismo y espera a que termine (tests, disparo manual).
+    // Ejecuta un ciclo ahora y espera a que termine (tests, disparo manual).
     tickAhora() { return tick(); },
+
+    ultimoTick: () => ultimoTick,
 
     set habilitado(v) { habilitado = v; },
     get habilitado()  { return habilitado; },
 
-    recargarHorarios() { franjas = cargarHorarios(); return franjas.length; },
+    // Franjas de un usuario: confirmadas + aprendidas por observación.
+    async franjasDe(chatId) {
+      const u = await store.getUsuario(chatId);
+      if (!u) return [];
+      return franjasDeUsuario({ ...u, chatId });
+    },
 
-    estadoTexto() {
-      const t       = ahora();
-      const activas = franjasActivas(franjas, t);
-      const lineas  = [
-        `*Modo automático*: ${habilitado ? '🟢 activo' : '⚪ pausado'}`,
-        `Configurado: ${configurado() ? 'sí' : 'no — faltan variables AUTO_*'}`,
-        `Ahora: ${NOMBRE_DIA[t.dia]} ${t.hhmm} (${TZ})`,
+    async estadoTexto(chatId) {
+      const t  = ahora();
+      const u  = await store.getUsuario(chatId);
+      const ip = await store.getIp();
+
+      if (!u) return 'No estás registrado. Usá /registrar para empezar.';
+
+      const franjas = await this.franjasDe(chatId);
+      const lineas = [
+        `*Tu modo automático*: ${u.auto ? '🟢 activo' : '⚪ pausado'}`,
+        `IP de UTN: ${ip ? `\`${ip}\`` : '❌ ninguna — usá /guardar\\_ip desde el WiFi de la facu'}`,
+        `Ahora: ${NOMBRE_DIA[t.dia]} ${t.hhmm}`,
         '',
       ];
 
+      if (franjas.length === 0) {
+        lineas.push(
+          '_Todavía no aprendí ninguna materia._',
+          '',
+          'Voy a consultar el sistema cada tanto y, en cuanto te vea una clase,',
+          'la aprendo sola. También podés forzarlo marcando una vez con /registrar.'
+        );
+        return lineas.join('\n');
+      }
+
+      const activas = franjasActivas(franjas, t);
       if (activas.length) {
         lineas.push('*En franja ahora:*');
         for (const f of activas) {
-          const st = estado[`${t.fecha}|${f.id}`];
+          const st = await store.getEstado(`${t.fecha}|${chatId}|${f.id}`);
           const marca = st?.resultado === 'ok'        ? '✅ registrada'
                       : st?.resultado === 'duplicada' ? '✅ ya estaba'
                       : st?.resultado === 'fallida'   ? `❌ falló tras ${st.intentos} intentos`
-                      : st?.resultado === 'sin-match' ? '⚠️ no la encuentro en el sistema'
                       : '⏳ esperando que habiliten';
-          lineas.push(`• ${f.materia} (${f.desde}–${f.hasta}) — ${marca}`);
+          lineas.push(`• ${f.materia} — ${marca}`);
         }
-      } else {
-        lineas.push('_Fuera de horario de cursada._');
+        lineas.push('');
       }
 
-      lineas.push('', '*Franjas configuradas:*');
-      for (const f of franjas) {
-        lineas.push(`• ${NOMBRE_DIA[f.dia]} ${f.desde}–${f.hasta} — ${f.materia}`);
+      lineas.push('*Horario aprendido:*');
+      for (const f of [...franjas].sort((a, b) => a.dia - b.dia || aMinutos(a.desde) - aMinutos(b.desde))) {
+        const conf = f.vistas ? ` _(${f.vistas} obs.)_` : '';
+        lineas.push(`• ${NOMBRE_DIA[f.dia]} ${f.desde}–${f.hasta} — ${f.materia}${conf}`);
       }
       return lineas.join('\n');
     },
-
-    configurado,
-
-    // Expuesto para /materias_hoy. Abre su propia sesión a propósito: compartir
-    // `sesion` con el tick permite que este la deje en null a mitad de camino.
-    async materiasAhora() {
-      const http = await utn.abrirSesion(cfg.legajo, cfg.password, cfg.ip);
-      return (await utn.listarMaterias(http)) ?? [];
-    },
-
-    _internos: { ahora, aMinutos, franjasActivas, buscarMateria, normalizar, cargarHorarios },
   };
 }
 
-module.exports = { crearAuto, ahora, aMinutos, franjasActivas, buscarMateria, normalizar };
+module.exports = {
+  crearAuto, ahora, aMinutos, aHHMM, franjasActivas, franjaDesdeObservacion,
+  intervaloMs, NOMBRE_DIA, TERMINALES, MAX_INTENTOS, DESCUBRIR_CADA_MIN,
+};
