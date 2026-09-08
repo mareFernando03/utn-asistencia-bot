@@ -225,6 +225,28 @@ function montar(porUsuario) {
         (await store.getObservaciones('111')).length === 0, 'quedó algo');
     }
 
+    // ── Orden de handlers en bot.js ──────────────────────────────────────────
+    // En Telegraf un comando ES un mensaje de texto, así que un bot.on('text')
+    // registrado antes de los bot.command() se los come a todos. Pasó: dejó 11
+    // comandos muertos sin ningún error visible.
+    {
+      const src = fs.readFileSync(path.join(__dirname, 'bot.js'), 'utf8');
+      const posText = src.indexOf("bot.on('text'");
+      const comandos = [...src.matchAll(/bot\.command\('([a-z_]+)'/g)];
+
+      chequear('bot.js registra un handler de texto', posText !== -1, 'no lo encontré');
+
+      const tardios = comandos.filter(m => m.index > posText).map(m => m[1]);
+      chequear('bot.on(text) va DESPUÉS de todos los bot.command()',
+        tardios.length === 0,
+        `quedarían muertos: ${tardios.join(', ')}`);
+
+      const bloque = src.slice(posText, posText + 400);
+      chequear('el handler de texto recibe y usa next()',
+        /bot\.on\('text',\s*async\s*\(ctx,\s*next\)/.test(src) && bloque.includes('next()'),
+        'no llama a next(), traga los mensajes que no le tocan');
+    }
+
     // ── intervaloMs: un valor basura no puede dar NaN ────────────────────────
     chequear('AUTO_INTERVAL_SEC basura → 60s',
       a.intervaloMs('medio') === 60000 && a.intervaloMs(undefined) === 60000, 'dio NaN');

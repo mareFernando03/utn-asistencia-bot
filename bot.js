@@ -116,43 +116,6 @@ bot.command('registrar', async ctx => {
   ctx.reply('Ingresá tu *legajo* SYSACAD:', { parse_mode: 'Markdown' });
 });
 
-bot.on('text', async ctx => {
-  const id    = String(ctx.chat.id);
-  const state = states.get(id);
-  if (!state) return;
-
-  const text = ctx.message.text.trim();
-
-  if (state.step === 'waiting_legajo') {
-    states.set(id, { step: 'waiting_password', legajo: text });
-    return ctx.reply('Ahora tu *contraseña* SYSACAD:', { parse_mode: 'Markdown' });
-  }
-
-  if (state.step === 'waiting_password') {
-    states.set(id, { ...state, step: 'waiting_consent', password: text });
-
-    // Consentimiento explícito: quien presta una credencial tiene que saber qué
-    // se guarda, quién puede verlo y cuánto dura.
-    return ctx.reply(
-      '*Antes de guardar, leé esto*\n\n' +
-      `• Guardo tu legajo y tu contraseña SYSACAD${cripto.hayClave() ? ', *cifrada*' : ', *sin cifrar*'}.\n` +
-      '• Esa contraseña abre toda tu cuenta académica, no solo la asistencia. ' +
-      'Si la reusás en otro lado, cambiala por una única.\n' +
-      '• Quien administra este bot tiene acceso al servidor donde se guarda.\n' +
-      '• El hosting es efímero: un redeploy borra todo y hay que cargarlo de nuevo.\n' +
-      '• Marco la asistencia según tu horario de cursada.\n' +
-      '• /olvida borra todo lo tuyo cuando quieras.',
-      {
-        parse_mode: 'Markdown',
-        ...Markup.inlineKeyboard([
-          [Markup.button.callback('Acepto, guardá mis datos', 'consent_ok')],
-          [Markup.button.callback('Cancelar', 'consent_no')],
-        ]),
-      }
-    );
-  }
-});
-
 bot.action('consent_no', async ctx => {
   states.delete(String(ctx.chat.id));
   await ctx.answerCbQuery();
@@ -179,10 +142,13 @@ bot.action('consent_ok', async ctx => {
 
   await ctx.editMessageText('✅ Datos guardados. Modo automático activo.');
 
+  // Tercer dato del alta, como siempre: la IP. Se pide acá y no con un comando
+  // aparte, porque es el paso natural del flujo y sin ella UTN rechaza todo.
   if (!(await store.getIp())) {
+    states.set(id, { step: 'waiting_ip', legajo: state.legajo, password: state.password });
     return ctx.reply(
-      '📶 Falta un paso: no tengo la IP de la red de UTN, y sin eso el sistema me ' +
-      'rechaza.\n\nUsá /guardar\\_ip *conectado al WiFi de la facu*.',
+      '📶 Último dato: la *IP de la red de UTN*.\n\n' +
+      'Conectate al WiFi de la facu, abrí https://api.ipify.org y pegá acá ese número.',
       { parse_mode: 'Markdown' }
     );
   }
@@ -195,8 +161,10 @@ async function ejecutarRegistrar(ctx, legajo, password) {
   const ip = await store.getIp();
 
   if (!ip) {
+    states.set(id, { step: 'waiting_ip', legajo, password });
     return ctx.reply(
-      '📶 No tengo la IP de la red de UTN. Usá /guardar\\_ip desde el WiFi de la facu.',
+      '📶 Me falta la *IP de la red de UTN*.\n\n' +
+      'Conectate al WiFi de la facu, abrí https://api.ipify.org y pegá acá ese número.',
       { parse_mode: 'Markdown' }
     );
   }
@@ -479,6 +447,79 @@ bot.command('diag', async ctx => {
       : ''),
     { parse_mode: 'Markdown' }
   );
+});
+
+// ─── Texto libre ──────────────────────────────────────────────────────────────
+// VA AL FINAL A PROPÓSITO. Un comando es un mensaje de texto, así que si este
+// handler se registra antes que los bot.command(), se los come a todos. Y
+// siempre llama a next() cuando no le corresponde manejar el mensaje.
+
+const RE_IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
+
+function esIPv4(s) {
+  return RE_IPV4.test(s) && s.split('.').every(n => +n >= 0 && +n <= 255);
+}
+
+bot.on('text', async (ctx, next) => {
+  const id    = String(ctx.chat.id);
+  const state = states.get(id);
+  const text  = ctx.message.text.trim();
+
+  if (!state) {
+    // Una IP suelta, sin nada pendiente, se interpreta como cargarla.
+    if (esIPv4(text)) {
+      await store.setIp(text, id);
+      return ctx.reply(`✅ IP de UTN cargada: ${text}`);
+    }
+    return next();
+  }
+
+  if (state.step === 'waiting_legajo') {
+    states.set(id, { ...state, step: 'waiting_password', legajo: text });
+    return ctx.reply('Ahora tu *contraseña* SYSACAD:', { parse_mode: 'Markdown' });
+  }
+
+  if (state.step === 'waiting_password') {
+    states.set(id, { ...state, step: 'waiting_consent', password: text });
+
+    // Consentimiento explícito: quien presta una credencial tiene que saber qué
+    // se guarda, quién puede verlo y cuánto dura.
+    return ctx.reply(
+      '*Antes de guardar, leé esto*\n\n' +
+      `• Guardo tu legajo y tu contraseña SYSACAD${cripto.hayClave() ? ', *cifrada*' : ', *sin cifrar*'}.\n` +
+      '• Esa contraseña abre toda tu cuenta académica, no solo la asistencia. ' +
+      'Si la reusás en otro lado, cambiala por una única.\n' +
+      '• Quien administra este bot tiene acceso al servidor donde se guarda.\n' +
+      '• El hosting es efímero: un redeploy borra todo y hay que cargarlo de nuevo.\n' +
+      '• Marco la asistencia según tu horario de cursada.\n' +
+      '• /olvida borra todo lo tuyo cuando quieras.',
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [Markup.button.callback('Acepto, guardá mis datos', 'consent_ok')],
+          [Markup.button.callback('Cancelar', 'consent_no')],
+        ]),
+      }
+    );
+  }
+
+  // Antes se tragaba el mensaje en silencio y parecía que el bot no respondía.
+  if (state.step === 'waiting_consent') {
+    return ctx.reply('Tocá *Acepto* o *Cancelar* en el mensaje de arriba.',
+      { parse_mode: 'Markdown' });
+  }
+
+  if (state.step === 'waiting_ip') {
+    if (!esIPv4(text)) {
+      return ctx.reply('Eso no parece una IPv4. Tiene que ser algo como 190.105.222.134');
+    }
+    await store.setIp(text, id);
+    states.delete(id);
+    await ctx.reply(`✅ IP cargada: ${text}\n\n⏳ Probando la conexión con UTN...`);
+    return ejecutarRegistrar(ctx, state.legajo, state.password);
+  }
+
+  return next();
 });
 
 // ─── Servidor HTTP: health check + captura de IP ──────────────────────────────
