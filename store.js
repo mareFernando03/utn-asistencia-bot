@@ -15,7 +15,7 @@ const cripto = require('./crypto');
 
 const STORE_PATH = process.env.STORE_PATH || path.join(__dirname, 'store.json');
 
-const VACIO = { usuarios: {}, utn: {}, estado: {}, observaciones: {} };
+const VACIO = { usuarios: {}, utn: {}, estado: {}, observaciones: {}, admins: [] };
 
 function leer() {
   try {
@@ -32,6 +32,30 @@ function escribir(db) {
   } catch (e) {
     console.error('[store] No se pudo guardar:', e.message);
   }
+}
+
+// ─── Autorizados ──────────────────────────────────────────────────────────────
+// Quién puede darse de alta. El primero en usar el bot lo reclama; después solo
+// entra quien él autorice. Así no hace falta configurar nada en el hosting.
+
+async function getAdmins() {
+  return leer().admins || [];
+}
+
+async function agregarAdmin(chatId) {
+  const db = leer();
+  db.admins = db.admins || [];
+  const id = String(chatId);
+  if (!db.admins.includes(id)) { db.admins.push(id); escribir(db); }
+  return db.admins;
+}
+
+async function quitarAdmin(chatId) {
+  const db = leer();
+  const id = String(chatId);
+  db.admins = (db.admins || []).filter(x => x !== id);
+  escribir(db);
+  return db.admins;
 }
 
 // ─── Usuarios ─────────────────────────────────────────────────────────────────
@@ -209,6 +233,7 @@ async function limpiarEstado(fecha) {
 
 module.exports = {
   STORE_PATH,
+  getAdmins, agregarAdmin, quitarAdmin,
   getUsuario, getUsuarioCrudo, setUsuario, borrarUsuario, usuariosActivos, contarUsuarios,
   agregarFranja, borrarFranja,
   registrarObservacion, getObservaciones, borrarObservaciones,

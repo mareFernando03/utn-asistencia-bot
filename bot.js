@@ -18,23 +18,28 @@ if (!BOT_TOKEN) throw new Error('Falta BOT_TOKEN en variables de entorno');
 const BOT_URL = process.env.BOT_URL || '';
 const PORT    = process.env.PORT || 3000;
 
-// Lista blanca de chat ids. Es OBLIGATORIA: el bot guarda contraseñas SYSACAD,
-// que abren la cuenta académica entera de quien las presta. Sin lista, cualquiera
-// que encuentre el bot podría entregarle su credencial, y este es un bot personal
-// para un grupo chico, no un servicio. Sin ALLOWED_IDS no se da de alta a nadie.
-const ALLOWED = new Set(
+// Quién puede usar el bot.
+//
+// El bot guarda contraseñas SYSACAD, que abren la cuenta académica entera de
+// quien las presta, así que NO puede ser de alta abierta. Pero tampoco hace
+// falta configurar nada en el hosting: el primero que lo usa lo reclama, y de
+// ahí en más solo entra quien ese dueño autorice con /autorizar.
+//
+// ALLOWED_IDS, si está definida, tiene prioridad y bloquea el reclamo.
+
+const ALLOWED_ENV = new Set(
   (process.env.ALLOWED_IDS || '').split(',').map(s => s.trim()).filter(Boolean)
 );
 
-if (ALLOWED.size === 0) {
-  console.warn(
-    '[bot] ALLOWED_IDS está vacía: nadie va a poder darse de alta. ' +
-    'Cargá los chat ids autorizados, separados por coma.'
-  );
+async function autorizado(chatId) {
+  const id = String(chatId);
+  if (ALLOWED_ENV.size > 0) return ALLOWED_ENV.has(id);
+  return (await store.getAdmins()).includes(id);
 }
 
-function autorizado(chatId) {
-  return ALLOWED.has(String(chatId));
+async function hayDuenio() {
+  if (ALLOWED_ENV.size > 0) return true;
+  return (await store.getAdmins()).length > 0;
 }
 
 // ─── Estado de conversación (en memoria) ──────────────────────────────────────
@@ -46,19 +51,32 @@ const tokensIp = new Map();   // token → { chatId, vence }
 
 const bot = new Telegraf(BOT_TOKEN);
 
-bot.use((ctx, next) => {
-  if (!autorizado(ctx.chat?.id)) {
-    // Mostrarle su propio id: es exactamente lo que hay que pegar en
-    // ALLOWED_IDS, y así no hace falta ir a buscarlo a otro bot.
-    return ctx.reply(
-      'Este es un bot privado y no estás en la lista de autorizados.\n\n' +
-      `Tu chat id es: ${ctx.chat?.id}\n\n` +
-      'Si el bot es tuyo, agregá ese número a la variable ALLOWED_IDS del ' +
-      'servidor (separá con comas si son varios) y volvé a escribirme.\n\n' +
-      'Si no es tuyo: no le mandes tu contraseña de SYSACAD a bots que no controlás.'
+bot.use(async (ctx, next) => {
+  const id = String(ctx.chat?.id);
+
+  if (await autorizado(id)) return next();
+
+  // Nadie reclamó el bot todavía: el primero que llega es el dueño.
+  if (!(await hayDuenio())) {
+    await store.agregarAdmin(id);
+    console.log(`[bot] Dueño reclamado por ${id}`);
+    await ctx.reply(
+      '👋 Sos la primera persona en usar este bot, así que quedaste como *dueño*.\n\n' +
+      'De acá en más no entra nadie más salvo que vos lo autorices con ' +
+      '`/autorizar <chat id>`.\n\n' +
+      'Empezá con /registrar.',
+      { parse_mode: 'Markdown' }
     );
+    return next();
   }
-  return next();
+
+  // Mostrarle su id: es lo que tiene que pasarle al dueño para que lo autorice.
+  return ctx.reply(
+    'Este es un bot privado y no estás autorizado.\n\n' +
+    `Tu chat id es: ${id}\n\n` +
+    'Pasale ese número a quien administra el bot para que te habilite.\n\n' +
+    'Y ojo: no le mandes tu contraseña de SYSACAD a bots que no controlás.'
+  );
 });
 
 bot.start(ctx =>
@@ -74,7 +92,10 @@ bot.start(ctx =>
     '• /horarios — las materias que marco solo\n' +
     '• /auto\\_off — pausarme · /auto\\_on — reanudarme\n' +
     '• /olvida — borrar todos tus datos\n' +
-    '• /diag — diagnóstico técnico',
+    '• /diag — diagnóstico técnico\n\n' +
+    '*Sumar a alguien*\n' +
+    '• Que le escriba al bot: le responde su chat id\n' +
+    '• Vos: /autorizar <ese número> · /autorizados · /desautorizar',
     { parse_mode: 'Markdown' }
   )
 );
@@ -285,6 +306,54 @@ bot.action('cancelar', async ctx => {
 // tiene que abrir un link estando en el campus. Ese request trae la IP pública de
 // la red, que es la misma para todos.
 
+// ─── Autorizar a otra persona ─────────────────────────────────────────────────
+
+bot.command('autorizar', async ctx => {
+  const arg = (ctx.message.text.split(/\s+/)[1] || '').trim();
+
+  if (ALLOWED_ENV.size > 0) {
+    return ctx.reply(
+      'Este bot usa la lista fija ALLOWED_IDS del servidor, así que no puedo ' +
+      'autorizar desde acá. Agregá el chat id a esa variable.'
+    );
+  }
+  if (!/^-?\d+$/.test(arg)) {
+    return ctx.reply(
+      'Uso: /autorizar <chat id>\n\n' +
+      'Que la persona le escriba al bot: le va a responder con su número. ' +
+      'Después pegámelo acá.'
+    );
+  }
+
+  await store.agregarAdmin(arg);
+  await ctx.reply(`✅ Autorizado: ${arg}\n\nYa puede usar /registrar.`);
+
+  bot.telegram.sendMessage(arg,
+    '✅ Te habilitaron para usar el bot. Empezá con /registrar.'
+  ).catch(() => {});
+});
+
+bot.command('desautorizar', async ctx => {
+  const arg = (ctx.message.text.split(/\s+/)[1] || '').trim();
+  if (!/^-?\d+$/.test(arg)) return ctx.reply('Uso: /desautorizar <chat id>');
+
+  if (String(ctx.chat.id) === arg) {
+    return ctx.reply('No te podés sacar a vos mismo: quedaría el bot sin dueño.');
+  }
+
+  await store.quitarAdmin(arg);
+  await store.borrarUsuario(arg);
+  await ctx.reply(`✅ ${arg} queda fuera, y borré sus credenciales y su horario.`);
+});
+
+bot.command('autorizados', async ctx => {
+  if (ALLOWED_ENV.size > 0) {
+    return ctx.reply(`Lista fija del servidor: ${[...ALLOWED_ENV].join(', ')}`);
+  }
+  const admins = await store.getAdmins();
+  await ctx.reply(`Autorizados (${admins.length}):\n${admins.join('\n')}`);
+});
+
 // Camino corto: la escribís a mano. Sirve cuando no hay BOT_URL configurada.
 bot.command('ip', async ctx => {
   const valor = (ctx.message.text.split(/\s+/)[1] || '').trim();
@@ -395,7 +464,8 @@ bot.command('diag', async ctx => {
     '*Diagnóstico*\n' +
     `Hora del server: ${NOMBRE_DIA[t.dia]} ${t.hhmm}\n` +
     `Scheduler: ${auto.habilitado ? '🟢' : '⚪'} · último tick: ${ult ? ult.hhmm : 'ninguno'}\n` +
-    `Autorizados: ${ALLOWED.size} · registrados: ${await store.contarUsuarios()}\n` +
+    `Autorizados: ${ALLOWED_ENV.size > 0 ? `${ALLOWED_ENV.size} (fijos)` : (await store.getAdmins()).length}` +
+    ` · registrados: ${await store.contarUsuarios()}\n` +
     `IP de UTN: ${ipi?.ip ? `\`${ipi.ip}\` (${(ipi.ts || '').slice(0, 16) || '?'})` : '❌ ninguna'}\n` +
     `BOT_URL: ${BOT_URL ? '✅' : '❌ sin configurar'}\n` +
     `Cifrado en reposo: ${cripto.hayClave() ? '✅ STORE_KEY presente' : '⚠️ sin STORE_KEY'}\n` +
