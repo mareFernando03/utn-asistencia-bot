@@ -30,23 +30,34 @@ function materia(id, nombre, habilitada = 'S') {
            anio: '2026', especialidad: '1', plan: '1', comision: 'A' };
 }
 
+// Reloj simulado. La cadencia del scheduler se mide en minutos, así que dos
+// ticks seguidos en el mismo minuto son UNO solo (a propósito): los tests que
+// encadenan ciclos tienen que mover el reloj. De paso quedan deterministas, sin
+// depender de a qué hora se corra la suite.
+const BASE  = new Date('2026-09-08T18:00:00-03:00');   // martes 18:00
+const enMin = n => new Date(BASE.getTime() + n * 60000);
+
 // Arma un auto con la red stubbeada. `porUsuario` mapea legajo → respuesta.
 function montar(porUsuario) {
-  const avisos = [];
-  const posts  = [];
+  const avisos    = [];
+  const posts     = [];
+  const consultas = [];   // cada lectura de materias = una petición a UTN
 
   utn.abrirSesion = async (legajo) => {
     if (!porUsuario[legajo]) throw new Error('LOGIN_FAILED');
     return { legajo };
   };
-  utn.listarMaterias = async (http) => porUsuario[http.legajo].materias;
+  utn.listarMaterias = async (http) => {
+    consultas.push(http.legajo);
+    return porUsuario[http.legajo].materias;
+  };
   utn.registrarAsistencia = async (http, m) => {
     posts.push({ legajo: http.legajo, materiaId: m.id });
     return porUsuario[http.legajo].respuesta;
   };
 
   const bot = { telegram: { sendMessage: async (chatId, txt) => avisos.push({ chatId, txt }) } };
-  return { auto: a.crearAuto(bot), avisos, posts };
+  return { auto: a.crearAuto(bot), avisos, posts, consultas };
 }
 
 (async () => {
@@ -85,7 +96,7 @@ function montar(porUsuario) {
       const { auto, posts } = montar({ L1: {
         materias: [materia('7', 'ARQ MOVILES', 'N')], respuesta: [],
       } });
-      await auto.tickAhora();
+      await auto.tickAhora(enMin(0));
 
       const obs = await store.getObservaciones('111');
       chequear('una materia no habilitada igual se aprende como horario',
@@ -99,15 +110,83 @@ function montar(porUsuario) {
         materias: [materia('7', 'ARQ MOVILES', 'S')],
         respuesta: ['Asistencia registrada exitosamente'],
       } });
-      await auto.tickAhora();
+      await auto.tickAhora(enMin(1));
       chequear('al habilitarse, registra', posts.length === 1, `POSTs=${posts.length}`);
       chequear('y avisa al usuario correcto',
         avisos.some(x => x.chatId === '111' && x.txt.includes('Asistencia registrada')),
         JSON.stringify(avisos));
 
-      await auto.tickAhora();
-      await auto.tickAhora();
+      await auto.tickAhora(enMin(2));
+      await auto.tickAhora(enMin(3));
       chequear('no vuelve a postear el mismo día', posts.length === 1, `POSTs=${posts.length}`);
+    }
+
+    // ── Cadencia: una franja resuelta deja de consultarse ────────────────────
+    limpiarStore();
+    {
+      await store.setIp('1.2.3.4', '111');
+      await store.setUsuario('111', { legajo: 'L1', password: 'p', auto: true, franjas: [] });
+
+      const { auto, posts, consultas } = montar({ L1: {
+        materias: [materia('7', 'ARQ MOVILES', 'S')],
+        respuesta: ['Asistencia registrada exitosamente'],
+      } });
+      for (let i = 0; i < 30; i++) await auto.tickAhora(enMin(i));
+
+      chequear('registrada la asistencia, no sigue preguntando cada minuto',
+        consultas.length <= 3, `consultas=${consultas.length} en 30 min`);
+      chequear('y postea una sola vez', posts.length === 1, `POSTs=${posts.length}`);
+    }
+
+    // ── Cadencia: docente que no habilita ────────────────────────────────────
+    limpiarStore();
+    {
+      await store.setIp('1.2.3.4', '111');
+      await store.setUsuario('111', { legajo: 'L1', password: 'p', auto: true, franjas: [] });
+
+      const { auto, consultas } = montar({ L1: {
+        materias: [materia('7', 'ARQ MOVILES', 'N')], respuesta: [],
+      } });
+      for (let i = 0; i < 30; i++) await auto.tickAhora(enMin(i));
+
+      chequear('mientras no habiliten, espacia las consultas',
+        consultas.length <= 15, `consultas=${consultas.length} en 30 min`);
+      chequear('...pero no deja de mirar', consultas.length >= 8,
+        `consultas=${consultas.length} en 30 min`);
+    }
+
+    // ── Cadencia: un login roto no se reintenta cada minuto ──────────────────
+    limpiarStore();
+    {
+      await store.setIp('1.2.3.4', '111');
+      await store.setUsuario('111', { legajo: 'NOPE', password: 'p', auto: true, franjas: [] });
+
+      const { auto, avisos } = montar({ L1: { materias: [], respuesta: [] } });
+      let intentos = 0;
+      const original = utn.abrirSesion;
+      utn.abrirSesion = async (...args) => { intentos++; return original(...args); };
+
+      for (let i = 0; i < 20; i++) await auto.tickAhora(enMin(i));
+      utn.abrirSesion = original;
+
+      chequear('un login rechazado se reintenta espaciado, no cada minuto',
+        intentos <= 5, `intentos=${intentos} en 20 min`);
+      chequear('y el aviso de error sale una sola vez',
+        avisos.filter(x => x.txt.includes('login rechazado')).length === 1,
+        JSON.stringify(avisos.map(x => x.txt.slice(0, 40))));
+    }
+
+    // ── Sesión viva sin materias no se confunde con sesión caída ─────────────
+    {
+      const sinClase = '<html><body><form action="apply-leave.php" method="post">' +
+                       'No hay materias en este momento</form></body></html>';
+      const login    = '<html><form action="index.php">' +
+                       '<input name="legajo"><input type="password" name="password"></form></html>';
+
+      chequear('una página propia sin materias NO es sesión caída',
+        real.sesionCaida(sinClase) === false, 'la daría por caída y rehace el login');
+      chequear('el formulario de login SÍ es sesión caída',
+        real.sesionCaida(login) === true, 'no detecta el logout');
     }
 
     // ── Dos usuarios no se cruzan ────────────────────────────────────────────
@@ -121,7 +200,7 @@ function montar(porUsuario) {
         L1: { materias: [materia('7', 'ARQ MOVILES')], respuesta: ['Asistencia registrada'] },
         L2: { materias: [materia('9', 'SEGURIDAD')],   respuesta: ['Asistencia registrada'] },
       });
-      await auto.tickAhora();
+      await auto.tickAhora(enMin(0));
 
       const deL1 = posts.filter(p => p.legajo === 'L1');
       const deL2 = posts.filter(p => p.legajo === 'L2');
@@ -152,7 +231,7 @@ function montar(porUsuario) {
       const { auto, posts, avisos } = montar({
         L2: { materias: [materia('9', 'SEGURIDAD')], respuesta: ['Asistencia registrada'] },
       });
-      await auto.tickAhora();
+      await auto.tickAhora(enMin(0));
 
       chequear('el usuario sano registra igual',
         posts.length === 1 && posts[0].legajo === 'L2', JSON.stringify(posts));
@@ -171,7 +250,7 @@ function montar(porUsuario) {
         materias: [materia('7', 'ARQ MOVILES')],
         respuesta: ['No se pudo registrar la asistencia'],
       } });
-      for (let i = 0; i < 8; i++) await auto.tickAhora();
+      for (let i = 0; i < 8; i++) await auto.tickAhora(enMin(i * 5));
 
       chequear('se rinde a los 3 POSTs, no uno por tick',
         posts.length === a.MAX_INTENTOS, `POSTs=${posts.length}`);
@@ -193,10 +272,10 @@ function montar(porUsuario) {
         materias: [materia('7', 'ARQ MOVILES')],
         respuesta: ['La asistencia no fue registrada'],
       } });
-      await auto.tickAhora();
+      await auto.tickAhora(enMin(0));
       chequear('no lo reporta como registrado',
         !avisos.some(x => x.txt.includes('*Asistencia registrada*')), JSON.stringify(avisos));
-      await auto.tickAhora();
+      await auto.tickAhora(enMin(5));
       chequear('y reintenta', posts.length === 2, `POSTs=${posts.length}`);
     }
 
@@ -205,7 +284,7 @@ function montar(porUsuario) {
     {
       await store.setUsuario('111', { legajo: 'L1', password: 'p', auto: true, franjas: [] });
       const { auto, posts } = montar({ L1: { materias: [materia('7', 'X')], respuesta: [] } });
-      await auto.tickAhora();
+      await auto.tickAhora(enMin(0));
       chequear('sin IP de UTN no consulta nada', posts.length === 0, `POSTs=${posts.length}`);
     }
 
@@ -215,7 +294,7 @@ function montar(porUsuario) {
       await store.setIp('1.2.3.4', '111');
       await store.setUsuario('111', { legajo: 'L1', password: 'p', auto: true, franjas: [] });
       const { auto } = montar({ L1: { materias: [materia('7', 'X')], respuesta: [] } });
-      await auto.tickAhora();
+      await auto.tickAhora(enMin(0));
 
       chequear('había observaciones antes de borrar',
         (await store.getObservaciones('111')).length === 1, 'no las hubo');

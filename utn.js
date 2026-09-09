@@ -11,6 +11,16 @@ const BASE = 'https://asistencia.frsfco.utn.edu.ar:4443';
 // Ignora certificado autofirmado del servidor UTN (igual que el .exe)
 const dispatcher = new Agent({ connect: { rejectUnauthorized: false } });
 
+// Contador de peticiones al servidor de UTN. El servidor es chico y compartido,
+// así que conviene poder ver en /diag si un cambio de cadencia bajó la carga de
+// verdad, en vez de suponerlo.
+const stats = { peticiones: 0, logins: 0, registros: 0, desde: Date.now() };
+
+function contadores() {
+  const min = Math.max(1, Math.round((Date.now() - stats.desde) / 60000));
+  return { ...stats, minutos: min, porMinuto: +(stats.peticiones / min).toFixed(2) };
+}
+
 // ─── Sesión HTTP ──────────────────────────────────────────────────────────────
 
 function makeHttpSession() {
@@ -29,6 +39,7 @@ function makeHttpSession() {
   }
 
   async function get(p) {
+    stats.peticiones++;
     const res = await fetch(`${BASE}${p}`, {
       dispatcher,
       headers: { 'User-Agent': 'Mozilla/5.0', Cookie: cookieHeader() },
@@ -38,6 +49,7 @@ function makeHttpSession() {
   }
 
   async function post(p, body) {
+    stats.peticiones++;
     const res = await fetch(`${BASE}${p}`, {
       method: 'POST',
       dispatcher,
@@ -122,6 +134,7 @@ function clasificarMensajes(mensajes) {
 // Abre sesión: login + validación de IP. Devuelve la sesión HTTP lista para usar.
 // Lanza Error('LOGIN_FAILED') o Error('IP_DENEGADA').
 async function abrirSesion(legajo, password, ip) {
+  stats.logins++;
   const http = makeHttpSession();
 
   await http.get('/index.php');
@@ -145,11 +158,27 @@ async function abrirSesion(legajo, password, ip) {
   return http;
 }
 
+// ¿Esta respuesta es la página propia, o PHP nos devolvió el login?
+//
+// Importa mucho más de lo que parece. Antes se daba la sesión por caducada
+// cuando faltaba el <select>, pero el <select> también falta cuando simplemente
+// no hay clase en este momento — que es la mayor parte del día. Resultado: el
+// scheduler rehacía el login completo (4 peticiones) en CADA tick, todo el día.
+// Ahora solo se rehace cuando el servidor efectivamente devolvió el formulario
+// de login o algo que no es la página de asistencias.
+function sesionCaida(html) {
+  const esLogin = /name=["']?legajo/i.test(html) && /type=["']?password/i.test(html);
+  if (esLogin) return true;
+  // Ni login ni página de asistencias: redirección, error, cuelgue. Reabrir.
+  return !/apply-leave/i.test(html) && !html.includes('<select');
+}
+
 // Lista las materias que el backend ofrece en este momento.
 // Devuelve null si la sesión caducó (hay que volver a abrirla).
+// Devuelve [] si la sesión está viva pero no hay clase ahora.
 async function listarMaterias(http) {
   const html = await http.get('/apply-leave.php');
-  if (!html.includes('<select')) return null;
+  if (sesionCaida(html)) return null;
   return parseMaterias(html);
 }
 
@@ -160,6 +189,7 @@ async function loginYObtenerMaterias(legajo, password, ip) {
 }
 
 async function registrarAsistencia(http, materia) {
+  stats.registros++;
   const html = await http.post('/apply-leave.php', {
     id_materia:      materia.id,
     anio_academico:  materia.anio,
@@ -173,6 +203,8 @@ async function registrarAsistencia(http, materia) {
 
 module.exports = {
   BASE,
+  contadores,
+  sesionCaida,
   makeHttpSession,
   parseMaterias,
   parseMensajes,

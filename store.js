@@ -15,21 +15,45 @@ const cripto = require('./crypto');
 
 const STORE_PATH = process.env.STORE_PATH || path.join(__dirname, 'store.json');
 
-const VACIO = { usuarios: {}, utn: {}, estado: {}, observaciones: {}, admins: [] };
+// Fábrica, no constante compartida: `{ ...VACIO }` copia las REFERENCIAS de los
+// objetos internos, así que un store vacío terminaba escribiendo dentro del
+// molde y arrastrando datos entre lecturas.
+function vacio() {
+  return { usuarios: {}, utn: {}, estado: {}, observaciones: {}, admins: [] };
+}
+
+// Caché en memoria del JSON parseado.
+//
+// El scheduler lee el store una decena de veces por tick y por usuario; leer y
+// parsear el archivo cada vez es trabajo puro de CPU y disco en un free tier.
+// La caché se invalida sola si el archivo cambió por fuera (mtime + tamaño),
+// así que los tests que borran o reescriben el archivo siguen andando.
+let cache = null;   // { db, mtimeMs, size, json }
 
 function leer() {
   try {
-    const raw = JSON.parse(fs.readFileSync(STORE_PATH, 'utf8'));
-    return { ...VACIO, ...raw };
+    const st = fs.statSync(STORE_PATH);
+    if (cache && cache.mtimeMs === st.mtimeMs && cache.size === st.size) return cache.db;
+    const json = fs.readFileSync(STORE_PATH, 'utf8');
+    const db   = { ...vacio(), ...JSON.parse(json) };
+    cache = { db, mtimeMs: st.mtimeMs, size: st.size, json };
+    return db;
   } catch {
-    return { ...VACIO, usuarios: {}, utn: {}, estado: {} };
+    cache = null;
+    return vacio();
   }
 }
 
 function escribir(db) {
+  const json = JSON.stringify(db, null, 2);
+  // Escritura idéntica a la última: no tocar el disco.
+  if (cache && cache.db === db && cache.json === json) return;
   try {
-    fs.writeFileSync(STORE_PATH, JSON.stringify(db, null, 2));
+    fs.writeFileSync(STORE_PATH, json);
+    const st = fs.statSync(STORE_PATH);
+    cache = { db, mtimeMs: st.mtimeMs, size: st.size, json };
   } catch (e) {
+    cache = null;
     console.error('[store] No se pudo guardar:', e.message);
   }
 }
@@ -149,6 +173,13 @@ async function borrarFranja(chatId, franjaId) {
 // que el usuario cargue nada y sin depender de cuándo marcó a mano.
 //
 // Clave: observaciones[chatId][`${dia}|${materiaId}`] = { desdeMin, hastaMin, vistas, materia, datos }
+//
+// La ventana se guarda con grano grueso: mientras dura una clase, cada tick
+// correría `hastaMin` un minuto y reescribiría el archivo entero. Como después
+// se le suma un margen de 15 minutos, redondear a OBS_PASO_MIN no pierde nada y
+// deja el store quieto durante la clase.
+
+const OBS_PASO_MIN = 5;
 
 async function registrarObservacion(chatId, dia, materia, minutos) {
   const db = leer();
@@ -169,6 +200,9 @@ async function registrarObservacion(chatId, dia, materia, minutos) {
       visto: new Date().toISOString(),
     };
   } else {
+    const ensancha = minutos < o.desdeMin || minutos - o.hastaMin >= OBS_PASO_MIN;
+    if (!ensancha) return o;   // nada nuevo que aprender: no se toca el disco
+
     o.desdeMin = Math.min(o.desdeMin, minutos);
     o.hastaMin = Math.max(o.hastaMin, minutos);
     o.vistas  += 1;
@@ -232,7 +266,7 @@ async function limpiarEstado(fecha) {
 }
 
 module.exports = {
-  STORE_PATH,
+  STORE_PATH, OBS_PASO_MIN,
   getAdmins, agregarAdmin, quitarAdmin,
   getUsuario, getUsuarioCrudo, setUsuario, borrarUsuario, usuariosActivos, contarUsuarios,
   agregarFranja, borrarFranja,

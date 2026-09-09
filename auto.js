@@ -28,14 +28,47 @@ const MAX_INTENTOS = 3;
 // Minutos antes del fin de franja en que se avisa "no se registró".
 const AVISO_FINAL_MIN = 10;
 
-// Techo de usuarios por tick: el server de UTN es frágil.
+// Techo de consultas por tick: el server de UTN es frágil.
 const MAX_USUARIOS_POR_TICK = 25;
+
+// ─── Cadencia ─────────────────────────────────────────────────────────────────
+//
+// El servidor de asistencias de UTN es chico y compartido, así que cada
+// petición cuesta. Cuatro reglas bajan el tráfico sin perder asistencias:
+//
+//  1. Piso duro por usuario: nunca más de una consulta por minuto, pase lo que
+//     pase con el intervalo del tick.
+//  2. Una franja ya resuelta hoy (registrada, duplicada o rendida) deja de
+//     consultarse a cadencia de franja y pasa a la cadencia lenta de barrido,
+//     que alcanza para seguir aprendiendo hasta dónde llega la clase.
+//  3. Dentro de una franja sin resolver, mientras el docente no habilite, la
+//     espera crece 1→2→…→BACKOFF_MAX_MIN. La ventana aprendida se estira sola
+//     con cada consulta, así que aunque el docente habilite sobre el final la
+//     franja sigue abierta cuando toca mirar de nuevo.
+//  4. El barrido de descubrimiento va lento en los días de la semana que ya
+//     están mapeados; materias nuevas casi solo aparecen al empezar el cuatri.
 
 // Barrido de descubrimiento: fuera de las franjas conocidas se consulta cada
 // tantos minutos, para mapear materias que todavía no se conocen.
-const DESCUBRIR_CADA_MIN = 15;
-const DESCUBRIR_DESDE    = 7 * 60;    // 07:00
-const DESCUBRIR_HASTA    = 24 * 60;   // 00:00
+const DESCUBRIR_CADA_MIN  = 15;       // día de la semana sin nada aprendido
+const DESCUBRIR_LENTO_MIN = 45;       // día ya mapeado
+const DESCUBRIR_DESDE     = 7 * 60;   // 07:00
+const DESCUBRIR_HASTA     = 23 * 60;  // 23:00
+
+// Piso entre dos consultas del mismo usuario, en minutos.
+const MIN_ENTRE_CONSULTAS = 1;
+
+// Techo del backoff dentro de una franja que el docente no habilitó todavía.
+const BACKOFF_MAX_MIN = entero(process.env.AUTO_BACKOFF_MAX_MIN, 3, 1, 15);
+
+// Espera tras un error de login/IP/red: reintentar cada minuto no arregla nada
+// y multiplica las peticiones por usuario roto.
+const ESPERA_ERROR_MIN = 5;
+
+function entero(valor, def, min, max) {
+  const n = parseInt(valor ?? '', 10);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : def;
+}
 
 // Margen que se le agrega a la ventana observada, en minutos.
 const MARGEN_OBSERVADO = 15;
@@ -118,7 +151,10 @@ function crearAuto(bot, opciones = {}) {
 
   const sesiones   = new Map();   // chatId → sesión HTTP reutilizada
   const errores    = new Map();   // chatId → último error avisado
-  const ultimoScan = new Map();   // chatId → minuto del último barrido
+  const ultimoScan = new Map();   // chatId → { fecha, minuto } del último barrido
+  const proxima    = new Map();   // chatId → { fecha, minuto } de la próxima consulta
+  const backoff    = new Map();   // chatId → espera actual, en minutos
+  let   arranque   = 0;           // rotación del turno cuando sobran usuarios
 
   async function avisar(chatId, texto) {
     try {
@@ -137,39 +173,92 @@ function crearAuto(bot, opciones = {}) {
       if (materias !== null) return { http: previa, materias };
       sesiones.delete(chatId);
     }
-    const http = await utn.abrirSesion(u.legajo, u.password, ip);
-    sesiones.set(chatId, http);
-    return { http, materias: (await utn.listarMaterias(http)) ?? [] };
+    try {
+      const http = await utn.abrirSesion(u.legajo, u.password, ip);
+      sesiones.set(chatId, http);
+      return { http, materias: (await utn.listarMaterias(http)) ?? [] };
+    } catch (e) {
+      sesiones.delete(chatId);
+      throw e;
+    }
+  }
+
+  // ¿Ya pasó el momento agendado para volver a consultar a este usuario?
+  function tocaConsultar(chatId, t) {
+    const p = proxima.get(chatId);
+    return !p || p.fecha !== t.fecha || t.minutos >= p.minuto;
+  }
+
+  function agendar(chatId, t, minutos) {
+    proxima.set(chatId, { fecha: t.fecha, minuto: t.minutos + Math.max(MIN_ENTRE_CONSULTAS, minutos) });
   }
 
   // ¿Corresponde consultar a este usuario en este instante?
-  // Sí si está dentro de alguna franja conocida sin resolver, o si toca barrido.
-  function debeConsultar(u, t, franjas) {
-    if (franjasActivas(franjas, t).length > 0) return 'franja';
+  // Sí si tiene una franja activa SIN resolver, o si le toca barrido.
+  //
+  // Que la franja esté resuelta importa: una vez registrada la asistencia, el
+  // resto de la clase no hay nada que preguntar, y antes se seguía preguntando
+  // cada minuto hasta que la ventana cerraba.
+  function debeConsultar(chatId, t, pendientes, observaciones) {
+    if (!tocaConsultar(chatId, t)) return null;
+    if (pendientes.length > 0) return 'franja';
 
     if (t.minutos < DESCUBRIR_DESDE || t.minutos >= DESCUBRIR_HASTA) return null;
-    const ultimo = ultimoScan.get(u.chatId);
-    if (ultimo == null || t.minutos - ultimo >= DESCUBRIR_CADA_MIN) return 'barrido';
+
+    // Un día de la semana ya mapeado casi no da sorpresas: basta con mirarlo de
+    // tanto en tanto para estirar la ventana aprendida.
+    const cada   = observaciones.some(o => o.dia === t.dia) ? DESCUBRIR_LENTO_MIN : DESCUBRIR_CADA_MIN;
+    const ultimo = ultimoScan.get(chatId);
+    if (!ultimo || ultimo.fecha !== t.fecha || t.minutos - ultimo.minuto >= cada) return 'barrido';
     return null;
   }
 
+  // Agenda la próxima consulta según lo que se acaba de ver.
+  //
+  // Sin franja pendiente no hay nada que esperar del servidor y manda la
+  // cadencia de barrido. Con una materia ya habilitada tampoco se espacia: se
+  // está por postear, y si el POST sale mal conviene reintentar enseguida.
+  function reprogramar(chatId, t, pendientes, materias) {
+    const habilitada = materias.some(m =>
+      m.habilitada === 'S' && pendientes.some(f => f.materiaId === m.id));
+
+    if (pendientes.length === 0 || habilitada) {
+      backoff.delete(chatId);
+      return agendar(chatId, t, MIN_ENTRE_CONSULTAS);
+    }
+    const espera = Math.min(BACKOFF_MAX_MIN, (backoff.get(chatId) || 0) + 1);
+    backoff.set(chatId, espera);
+    agendar(chatId, t, espera);
+  }
+
   // Franjas confirmadas por el usuario + las aprendidas por observación.
-  async function franjasDeUsuario(u) {
-    const observaciones = await store.getObservaciones(u.chatId);
-    const confirmadas   = u.franjas || [];
-    const ids           = new Set(confirmadas.map(f => f.id));
+  function combinarFranjas(confirmadas, observaciones) {
+    const ids = new Set((confirmadas || []).map(f => f.id));
     return [
-      ...confirmadas,
+      ...(confirmadas || []),
       ...observaciones.map(franjaDesdeObservacion).filter(f => !ids.has(f.id)),
     ];
   }
 
-  async function procesarUsuario(u, t, ip) {
-    const observaciones = await store.getObservaciones(u.chatId);
-    const franjasPrevias = await franjasDeUsuario(u);
+  async function franjasDeUsuario(u) {
+    return combinarFranjas(u.franjas, await store.getObservaciones(u.chatId));
+  }
 
-    const motivo = debeConsultar({ ...u, chatId: u.chatId }, t, franjasPrevias);
-    if (!motivo) return;
+  // Devuelve true si efectivamente consultó al servidor de UTN: el tick lleva
+  // presupuesto de CONSULTAS, no de usuarios mirados.
+  async function procesarUsuario(u, t, ip) {
+    const observaciones  = await store.getObservaciones(u.chatId);
+    const franjasPrevias = combinarFranjas(u.franjas, observaciones);
+
+    // Franjas activas que todavía tienen algo que resolver hoy.
+    const pendientes = [];
+    for (const f of franjasActivas(franjasPrevias, t)) {
+      const st = await store.getEstado(`${t.fecha}|${u.chatId}|${f.id}`);
+      if (!TERMINALES.has(st?.resultado)) pendientes.push(f);
+    }
+
+    const motivo = debeConsultar(u.chatId, t, pendientes, observaciones);
+    if (!motivo) return false;
 
     let http, materias;
     try {
@@ -181,6 +270,9 @@ function crearAuto(bot, opciones = {}) {
       }
     } catch (e) {
       sesiones.delete(u.chatId);
+      // Reintentar cada minuto un login que el servidor rechaza no arregla
+      // nada y multiplica las peticiones por cada usuario roto.
+      agendar(u.chatId, t, ESPERA_ERROR_MIN);
       const motivoErr =
         e.message === 'LOGIN_FAILED' ? 'login rechazado — si cambiaste tu contraseña SYSACAD, usá /olvida y volvé a cargarla' :
         e.message === 'IP_DENEGADA'  ? 'UTN rechazó la IP — hay que actualizarla con /guardar\\_ip desde el WiFi de la facu' :
@@ -189,10 +281,11 @@ function crearAuto(bot, opciones = {}) {
         errores.set(u.chatId, motivoErr);
         await avisar(u.chatId, `❌ *Modo automático*: ${motivoErr}.\n_Sigo reintentando._`);
       }
-      return;
+      return true;
     }
 
-    if (motivo === 'barrido') ultimoScan.set(u.chatId, t.minutos);
+    reprogramar(u.chatId, t, pendientes, materias);
+    if (motivo === 'barrido') ultimoScan.set(u.chatId, { fecha: t.fecha, minuto: t.minutos });
 
     // Toda materia listada implica que hay clase ahora: es horario, se anota
     // esté habilitada o no.
@@ -207,7 +300,7 @@ function crearAuto(bot, opciones = {}) {
     // está habilitada, hay que registrarla en este mismo ciclo. Esperar al
     // siguiente podía costar hasta 15 minutos (el paso del barrido) y perder la
     // ventana entera del docente.
-    const franjas = await franjasDeUsuario(u);
+    const franjas = combinarFranjas(u.franjas, await store.getObservaciones(u.chatId));
 
     // Registrar donde corresponda.
     for (const f of franjas) {
@@ -280,12 +373,14 @@ function crearAuto(bot, opciones = {}) {
         `(la vi a las ${t.hhmm}).\n\n` +
         `Ya la voy a marcar sola. Mirá /horarios para ver la ventana que aprendí.`);
     }
+
+    return true;
   }
 
-  async function tick() {
+  async function tick(momento) {
     if (!habilitado || corriendo) return;
 
-    const t = ahora();
+    const t = ahora(momento);
     ultimoTick = t;
 
     const usuarios = await store.usuariosActivos();
@@ -297,13 +392,20 @@ function crearAuto(bot, opciones = {}) {
     corriendo = true;
     try {
       await store.limpiarEstado(t.fecha);
-      for (const u of usuarios.slice(0, MAX_USUARIOS_POR_TICK)) {
+
+      // El techo es de CONSULTAS, no de usuarios: mirar a alguien a quien no le
+      // toca no cuesta ninguna petición. Y el turno rota, así que con muchos
+      // usuarios no entran siempre los mismos.
+      let presupuesto = MAX_USUARIOS_POR_TICK;
+      for (let i = 0; i < usuarios.length && presupuesto > 0; i++) {
+        const u = usuarios[(arranque + i) % usuarios.length];
         try {
-          await procesarUsuario(u, t, ip);
+          if (await procesarUsuario(u, t, ip)) presupuesto--;
         } catch (e) {
           console.error(`[auto] usuario ${u.chatId}:`, e.message);
         }
       }
+      arranque = usuarios.length ? (arranque + MAX_USUARIOS_POR_TICK) % usuarios.length : 0;
     } finally {
       corriendo = false;
     }
@@ -319,8 +421,21 @@ function crearAuto(bot, opciones = {}) {
 
     detener() { if (timer) clearInterval(timer); timer = null; },
 
-    // Ejecuta un ciclo ahora y espera a que termine (tests, disparo manual).
-    tickAhora() { return tick(); },
+    // Sesión HTTP compartida con los comandos manuales: si el scheduler ya tiene
+    // una sesión viva de este usuario, /registrar no rehace el login (4
+    // peticiones) para preguntar lo mismo.
+    materiasDe(chatId, u, ip) { return obtenerMaterias(chatId, u, ip); },
+
+    // Al borrar o desautorizar a alguien no queda su sesión colgada, ni su
+    // agenda de consultas si vuelve a darse de alta.
+    olvidarSesion(chatId) {
+      for (const m of [sesiones, errores, ultimoScan, proxima, backoff]) m.delete(chatId);
+    },
+
+    // Ejecuta un ciclo y espera a que termine (tests, disparo manual).
+    // `momento` permite simular el reloj: la cadencia depende del minuto, así
+    // que sin eso no se puede testear más de un ciclo seguido.
+    tickAhora(momento) { return tick(momento); },
 
     ultimoTick: () => ultimoTick,
 
@@ -385,5 +500,6 @@ function crearAuto(bot, opciones = {}) {
 
 module.exports = {
   crearAuto, ahora, aMinutos, aHHMM, franjasActivas, franjaDesdeObservacion,
-  intervaloMs, NOMBRE_DIA, TERMINALES, MAX_INTENTOS, DESCUBRIR_CADA_MIN,
+  intervaloMs, NOMBRE_DIA, TERMINALES, MAX_INTENTOS,
+  DESCUBRIR_CADA_MIN, DESCUBRIR_LENTO_MIN, BACKOFF_MAX_MIN, ESPERA_ERROR_MIN,
 };

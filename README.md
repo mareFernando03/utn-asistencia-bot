@@ -7,7 +7,7 @@ El problema que resuelve: el docente habilita la asistencia en una ventana de po
 Dos modos:
 
 - **Manual** — `/registrar`, elegís la materia de una lista.
-- **Automático** — durante tus clases consulta cada minuto y registra en cuanto el docente habilita.
+- **Automático** — durante tus clases mira el sistema y registra en cuanto el docente habilita.
 
 > **Bot privado.** Guarda contraseñas SYSACAD, que abren la cuenta académica completa de quien las presta. `ALLOWED_IDS` es obligatoria: sin esa lista blanca no se da de alta a nadie.
 
@@ -36,7 +36,19 @@ No hace falta cargarlo. Sale del propio servidor de UTN.
 
 **La clave:** el sistema solo lista una materia cuando hay clase de esa materia *en ese momento*, independientemente de que el docente haya habilitado la asistencia — eso último es el flag `habilitada` (🟢/🔴). Entonces anotar **cuándo aparece** cada materia equivale a leer tu horario de cursada de la fuente autoritativa.
 
-El bot consulta cada 15 minutos fuera de las franjas conocidas y, en cuanto te ve una clase nueva, la aprende y te avisa. La ventana es el envolvente de lo observado más 15 minutos de margen, y se va ajustando sola con cada clase.
+El bot barre cada 15 minutos los días de la semana que todavía no conoce y cada 45 los que ya tiene mapeados; en cuanto te ve una clase nueva, la aprende y te avisa. La ventana es el envolvente de lo observado más 15 minutos de margen, y se va ajustando sola con cada clase.
+
+### Cuántas veces pregunta
+
+El servidor de asistencias de UTN es chico y compartido, así que el bot cuida las peticiones:
+
+- **Piso de una consulta por minuto y por usuario**, sea cual sea `AUTO_INTERVAL_SEC`.
+- **Franja ya resuelta** (registrada, duplicada o rendida): deja de preguntar por esa clase y pasa a la cadencia lenta de barrido.
+- **Franja abierta sin habilitar todavía**: la espera crece 1 → 2 → 3 minutos. Con la materia habilitada vuelve al mínimo.
+- **Login o IP rechazados**: reintenta cada 5 minutos, no cada minuto.
+- **Sesión HTTP reutilizada**: solo se rehace el login cuando el servidor devuelve el formulario de login. `/registrar` a mano aprovecha la sesión que ya tiene el scheduler.
+
+En una clase de 3 horas eso son ~4 consultas si el docente habilita temprano y ~60 si no habilita nunca, contra las 180 de un sondeo por minuto. `/diag` muestra el contador real de peticiones.
 
 Dos consecuencias que importan:
 
@@ -75,7 +87,8 @@ Variables de entorno:
 | `STORE_KEY` | recomendada | Clave para cifrar contraseñas en reposo |
 | `BOT_URL` | sí | URL pública — sin esto no anda `/guardar_ip` |
 | `AUTO_ENABLED` | no | `false` para arrancar pausado |
-| `AUTO_INTERVAL_SEC` | no | Intervalo de consulta, mínimo 30, default 60 |
+| `AUTO_INTERVAL_SEC` | no | Intervalo del tick, mínimo 30, default 60 |
+| `AUTO_BACKOFF_MAX_MIN` | no | Espera máxima entre consultas de una franja sin habilitar, default 3 |
 | `AUTO_FORZAR` | no | `true` = intentar igual si nunca habilitaron |
 
 **El plan free de Render duerme el servicio tras ~15 min sin tráfico.** Con `BOT_URL` el bot se auto-pinguea cada 10 min, pero lo confiable es un cron externo ([cron-job.org](https://cron-job.org)) que pegue a la URL. Si el servicio está dormido cuando empieza tu clase, no hay scheduler.

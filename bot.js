@@ -109,7 +109,8 @@ bot.command('registrar', async ctx => {
   const u = await store.getUsuario(id);
   if (u?.legajo && u?.password) {
     await ctx.reply('⏳ Conectando con UTN...');
-    return ejecutarRegistrar(ctx, u.legajo, u.password);
+    // Credenciales ya validadas: si el scheduler tiene sesión viva, se reusa.
+    return ejecutarRegistrar(ctx, u.legajo, u.password, true);
   }
 
   states.set(id, { step: 'waiting_legajo' });
@@ -156,7 +157,10 @@ bot.action('consent_ok', async ctx => {
   await ejecutarRegistrar(ctx, state.legajo, state.password);
 });
 
-async function ejecutarRegistrar(ctx, legajo, password) {
+// `reusar` solo cuando las credenciales son las que ya están guardadas: en el
+// alta hay que probarlas de verdad contra el servidor, no contra una sesión que
+// quedó abierta con la contraseña anterior.
+async function ejecutarRegistrar(ctx, legajo, password, reusar = false) {
   const id = String(ctx.chat.id);
   const ip = await store.getIp();
 
@@ -171,7 +175,9 @@ async function ejecutarRegistrar(ctx, legajo, password) {
 
   let sesion, materias;
   try {
-    ({ http: sesion, materias } = await utn.loginYObtenerMaterias(legajo, password, ip));
+    ({ http: sesion, materias } = reusar
+      ? await auto.materiasDe(id, { legajo, password }, ip)
+      : await utn.loginYObtenerMaterias(legajo, password, ip));
   } catch (e) {
     if (e.message === 'LOGIN_FAILED') {
       return ctx.reply(
@@ -310,6 +316,7 @@ bot.command('desautorizar', async ctx => {
   }
 
   await store.quitarAdmin(arg);
+  auto.olvidarSesion(arg);
   await store.borrarUsuario(arg);
   await ctx.reply(`✅ ${arg} queda fuera, y borré sus credenciales y su horario.`);
 });
@@ -414,6 +421,7 @@ bot.command('horarios', async ctx => {
 bot.command('olvida', async ctx => {
   const id = String(ctx.chat.id);
   states.delete(id);
+  auto.olvidarSesion(id);
   const habia = await store.borrarUsuario(id);
   ctx.reply(habia
     ? '✅ Borré tus credenciales, tu horario y tu estado. Usá /registrar para volver.'
@@ -427,11 +435,14 @@ bot.command('diag', async ctx => {
   const ipi = await store.getIpInfo();
   const u   = await store.getUsuarioCrudo(id);
   const ult = auto.ultimoTick();
+  const net = utn.contadores();
 
   await ctx.reply(
     '*Diagnóstico*\n' +
     `Hora del server: ${NOMBRE_DIA[t.dia]} ${t.hhmm}\n` +
     `Scheduler: ${auto.habilitado ? '🟢' : '⚪'} · último tick: ${ult ? ult.hhmm : 'ninguno'}\n` +
+    `Peticiones a UTN: ${net.peticiones} en ${net.minutos} min ` +
+    `(${net.porMinuto}/min · ${net.logins} login${net.logins === 1 ? '' : 's'})\n` +
     `Autorizados: ${ALLOWED_ENV.size > 0 ? `${ALLOWED_ENV.size} (fijos)` : (await store.getAdmins()).length}` +
     ` · registrados: ${await store.contarUsuarios()}\n` +
     `IP de UTN: ${ipi?.ip ? `\`${ipi.ip}\` (${(ipi.ts || '').slice(0, 16) || '?'})` : '❌ ninguna'}\n` +
